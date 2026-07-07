@@ -81,7 +81,7 @@ All keys in `docker-compose.yml` are fake-value dev keys for the local fork.
 | 2 | Rules layer: route/caller → price | ✅ [notes](docs/milestone-2.md) |
 | 3 | Firn flagship demo: pay-per-query search | ✅ [notes](docs/milestone-3.md) |
 | 4 | Payments indexer → Postgres | ✅ [notes](docs/milestone-4.md) |
-| 5 | Observability: OTel + Grafana | — |
+| 5 | Observability: OTel + Grafana | ✅ [notes](docs/milestone-5.md) |
 | 6 | Base Sepolia smoke test | — |
 
 Built local-first: rung 1 is the offline anvil loop above, rung 2 will swap in

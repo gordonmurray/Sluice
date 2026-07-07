@@ -1,0 +1,34 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+connectors:
+  # Derive request-duration histograms from spans, so settle latency comes
+  # from the facilitator's traces without any code changes.
+  spanmetrics:
+    histogram:
+      unit: ms
+    metrics_flush_interval: 5s
+    dimensions:
+      - name: http.method
+      - name: http.route
+      - name: otel.name
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [spanmetrics, debug]
+    metrics:
+      receivers: [otlp, spanmetrics]
+      exporters: [prometheus]

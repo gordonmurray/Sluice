@@ -1,0 +1,21 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prom
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+
+  - name: Payments (Postgres)
+    uid: pg
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    user: sluice
+    jsonData:
+      database: sluice
+      sslmode: disable
+    secureJsonData:
+      password: sluice
