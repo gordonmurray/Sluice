@@ -82,7 +82,7 @@ All keys in `docker-compose.yml` are fake-value dev keys for the local fork.
 | 3 | Firn flagship demo: pay-per-query search | ✅ [notes](docs/milestone-3.md) |
 | 4 | Payments indexer → Postgres | ✅ [notes](docs/milestone-4.md) |
 | 5 | Observability: OTel + Grafana | ✅ [notes](docs/milestone-5.md) |
-| 6 | Base Sepolia smoke test | — |
+| 6 | Base Sepolia smoke test | ⏸ [what it needs](docs/rung-2.md) |
 
 Built local-first: rung 1 is the offline anvil loop above, rung 2 will swap in
 Base Sepolia (`docker-compose.testnet.yml`), rung 3 is production on ECS with
