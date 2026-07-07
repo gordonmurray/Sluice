@@ -99,6 +99,35 @@ services:
       FIRNFLOW_BIND: "0.0.0.0:3000"
       RUST_LOG: info
 
+  postgres:
+    image: postgres:17-alpine
+    container_name: sluice-postgres
+    environment:
+      POSTGRES_USER: sluice
+      POSTGRES_PASSWORD: sluice
+      POSTGRES_DB: sluice
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sluice -d sluice"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  indexer:
+    # Settlement receipts -> Postgres. Applies migrations/ at startup.
+    build:
+      context: .
+    container_name: sluice-indexer
+    entrypoint: ["/usr/local/bin/indexer"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://sluice:sluice@postgres:5432/sluice
+      BIND: "0.0.0.0:8090"
+      RUST_LOG: info
+
   seed-firn:
     # One-shot: seed the demo namespace with text rows (direct to Firn;
     # admin writes are not exposed through the gateway).
@@ -121,6 +150,7 @@ services:
     depends_on:
       - facilitator
       - firnflow
+      - indexer
     ports:
       - "8080:8080"
     volumes:
@@ -131,6 +161,7 @@ services:
       PAY_TO: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
       RULES_PATH: /app/rules.json
       STRIP_PREFIX: /firn
+      INDEXER_URL: http://indexer:8090
       RUST_LOG: info,gateway=debug
 
   client:
@@ -148,3 +179,4 @@ services:
 
 volumes:
   minio-data:
+  postgres-data:

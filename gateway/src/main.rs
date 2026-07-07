@@ -14,6 +14,7 @@ use rules::{Decision, RuleSet};
 use x402_axum::X402Middleware;
 use x402_chain_eip155::{KnownNetworkEip155, V2Eip155Exact};
 use x402_types::networks::USDC;
+use x402_types::proto::SettleResponse;
 
 /// Largest request body the proxy will buffer before forwarding.
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
@@ -27,6 +28,8 @@ struct AppState {
     strip_prefix: Option<String>,
     http: reqwest::Client,
     rules: Arc<RuleSet>,
+    pay_to: String,
+    indexer_url: Option<String>,
 }
 
 #[tokio::main]
@@ -41,14 +44,18 @@ async fn main() -> anyhow::Result<()> {
         .context("PAY_TO is not a valid EVM address")?;
     let rules_path = env::var("RULES_PATH").context("RULES_PATH is required")?;
     let strip_prefix = env::var("STRIP_PREFIX").ok().filter(|s| !s.is_empty());
+    let indexer_url = env::var("INDEXER_URL").ok().filter(|s| !s.is_empty());
     let bind = env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
     let rules_json = std::fs::read_to_string(&rules_path)
         .with_context(|| format!("cannot read rules table at {rules_path}"))?;
     let rules = Arc::new(RuleSet::from_json(&rules_json)?);
 
+    // Settle before forwarding: the origin never does unpaid work, and the
+    // settlement lands in the request extensions for the indexer.
     let x402 = X402Middleware::try_from(facilitator_url.clone())
-        .map_err(|e| anyhow::anyhow!("invalid FACILITATOR_URL: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("invalid FACILITATOR_URL: {e}"))?
+        .settle_before_execution();
 
     // Price tags are derived per-request from the rules table. Free and
     // denied requests get no price tag (the x402 layer then forwards them
@@ -82,6 +89,8 @@ async fn main() -> anyhow::Result<()> {
         strip_prefix,
         http: reqwest::Client::new(),
         rules,
+        pay_to: format!("{pay_to}"),
+        indexer_url,
     });
 
     let app = Router::new()
@@ -112,9 +121,22 @@ async fn proxy(State(st): State<Arc<AppState>>, req: Request) -> Response {
         return (StatusCode::BAD_REQUEST, "malformed path").into_response();
     }
     let caller = caller_id(req.headers());
-    if st.rules.decide(req.uri().path(), caller.as_deref()) == Decision::Deny {
+    let decision = st.rules.decide(req.uri().path(), caller.as_deref());
+    if decision == Decision::Deny {
         return (StatusCode::NOT_FOUND, "no route").into_response();
     }
+
+    // The x402 layer stores the settlement result as a request extension.
+    // Report it to the indexer without holding up the proxied response.
+    if let Some(settlement) = req
+        .extensions()
+        .get::<Option<SettleResponse>>()
+        .cloned()
+        .flatten()
+    {
+        report_settlement(&st, settlement, req.uri().path(), caller.as_deref(), decision);
+    }
+
     match forward(&st, req).await {
         Ok(resp) => resp,
         Err(err) => {
@@ -186,6 +208,69 @@ fn caller_id(headers: &axum::http::HeaderMap) -> Option<String> {
     }
     let s = first.to_str().ok()?.trim();
     if s.is_empty() { None } else { Some(s.to_owned()) }
+}
+
+/// Fire-and-forget a settlement receipt to the indexer. Failures are logged,
+/// never propagated — indexing is bookkeeping, not part of the paid request.
+fn report_settlement(
+    st: &AppState,
+    settlement: SettleResponse,
+    path: &str,
+    caller: Option<&str>,
+    decision: Decision,
+) {
+    let Some(indexer_url) = st.indexer_url.clone() else {
+        return;
+    };
+    let amount = match decision {
+        Decision::Paid { micro_usdc } => micro_usdc as i64,
+        _ => return, // settlement without a paid decision cannot happen
+    };
+    // Read the fields via JSON so this stays agnostic to the exact
+    // SettleResponse struct layout (it is the wire format either way), but
+    // validate them — a silently-null field would fail indexer-side and
+    // masquerade as a transient error.
+    let v = match serde_json::to_value(&settlement) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot serialize settlement");
+            return;
+        }
+    };
+    let (Some(tx_hash), Some(network), Some(payer), Some(success)) = (
+        v["transaction"].as_str(),
+        v["network"].as_str(),
+        v["payer"].as_str(),
+        v["success"].as_bool(),
+    ) else {
+        tracing::error!(settlement = %v, "settlement missing expected fields; not indexing");
+        return;
+    };
+    // amount/pay_to are what the gateway charged (see migrations/0001);
+    // the v2 SettleResponse carries no amount to cross-check against.
+    let receipt = serde_json::json!({
+        "tx_hash": tx_hash,
+        "network": network,
+        "payer": payer,
+        "pay_to": st.pay_to,
+        "amount_micro_usdc": amount,
+        "path": path,
+        "caller": caller,
+        "success": success,
+    });
+    let http = st.http.clone();
+    tokio::spawn(async move {
+        let res = http
+            .post(format!("{indexer_url}/receipts"))
+            .json(&receipt)
+            .send()
+            .await;
+        match res {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => tracing::error!(status = %r.status(), "indexer rejected receipt"),
+            Err(e) => tracing::error!(error = %e, "cannot reach indexer"),
+        }
+    });
 }
 
 /// Rules match the raw request path, but URL parsers downstream normalize

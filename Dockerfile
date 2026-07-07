@@ -16,6 +16,7 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/gateway /usr/local/bin/gateway
 COPY --from=builder /build/target/release/client /usr/local/bin/client
+COPY --from=builder /build/target/release/indexer /usr/local/bin/indexer
 
 ENV BIND=0.0.0.0:8080
 ENV RUST_LOG=info
