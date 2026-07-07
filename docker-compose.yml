@@ -108,11 +108,14 @@ services:
       - firnflow
     ports:
       - "8080:8080"
+    volumes:
+      - ./config/rules.json:/app/rules.json:ro
     environment:
       ORIGIN_URL: http://firnflow:3000
       FACILITATOR_URL: http://facilitator:8080
       PAY_TO: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
-      PRICE_USDC: "0.01"
+      RULES_PATH: /app/rules.json
+      STRIP_PREFIX: /firn
       RUST_LOG: info,gateway=debug
 
   client:
