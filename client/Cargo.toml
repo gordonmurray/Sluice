@@ -1,0 +1,18 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+
+# "telemetry" is effectively required: 2.0.1 references `tracing` outside
+# the feature gate and fails to compile without it.
+x402-chain-eip155 = { workspace = true, features = ["client", "telemetry"] }
+x402-reqwest = { workspace = true, features = ["telemetry"] }
+
+alloy-signer-local = { workspace = true }

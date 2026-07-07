@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["gateway", "client"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+axum = "0.8"
+# 0.13 to match x402-reqwest 2.0.1 (same `reqwest::Client` type)
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# x402 (pulled in, not forked — see CLAUDE.md)
+x402-axum = "2.0"
+x402-chain-eip155 = "2.0"
+x402-reqwest = "2.0"
+x402-types = "2.0"
+
+# alloy types the x402 crates already pull in
+alloy-primitives = "1"
+alloy-signer-local = "2"
