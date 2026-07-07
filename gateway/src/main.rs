@@ -58,7 +58,13 @@ async fn main() -> anyhow::Result<()> {
         let rules = rules.clone();
         move |headers: &axum::http::HeaderMap, uri: &axum::http::Uri, _base: Option<&reqwest::Url>| {
             let caller = caller_id(headers);
-            let decision = rules.decide(uri.path(), caller.as_deref());
+            // Suspicious paths get no price tag so nobody pays for a request
+            // the proxy handler is going to reject.
+            let decision = if path_is_suspicious(uri.path()) {
+                Decision::Deny
+            } else {
+                rules.decide(uri.path(), caller.as_deref())
+            };
             let usdc = usdc.clone();
             async move {
                 match decision {
@@ -102,6 +108,9 @@ async fn healthz() -> impl IntoResponse {
 /// chain. Paths no rule covers are refused here (the layer attaches no price
 /// tag to them, so they'd otherwise pass through unpaid).
 async fn proxy(State(st): State<Arc<AppState>>, req: Request) -> Response {
+    if path_is_suspicious(req.uri().path()) {
+        return (StatusCode::BAD_REQUEST, "malformed path").into_response();
+    }
     let caller = caller_id(req.headers());
     if st.rules.decide(req.uri().path(), caller.as_deref()) == Decision::Deny {
         return (StatusCode::NOT_FOUND, "no route").into_response();
@@ -179,6 +188,19 @@ fn caller_id(headers: &axum::http::HeaderMap) -> Option<String> {
     if s.is_empty() { None } else { Some(s.to_owned()) }
 }
 
+/// Rules match the raw request path, but URL parsers downstream normalize
+/// dot segments — so `/a/query/../admin` would be priced as `/a/query` and
+/// delivered to the origin as `/a/admin`. Refuse anything that could
+/// normalize into a different path: dot segments (plain or percent-encoded)
+/// and empty segments.
+fn path_is_suspicious(path: &str) -> bool {
+    path.contains("//")
+        || path.split('/').any(|seg| {
+            let l = seg.to_ascii_lowercase();
+            matches!(l.as_str(), "." | ".." | "%2e" | "%2e%2e" | ".%2e" | "%2e.")
+        })
+}
+
 /// Strip `prefix` from `path` on whole-segment boundaries only: `/firn` is
 /// stripped from `/firn/health` (→ `/health`) and `/firn` (→ `/`), but not
 /// from `/firnabc`.
@@ -241,6 +263,24 @@ mod tests {
         assert_eq!(strip_path_prefix("/firn", "/firn"), "/");
         assert_eq!(strip_path_prefix("/firnabc", "/firn"), "/firnabc");
         assert_eq!(strip_path_prefix("/other", "/firn"), "/other");
+    }
+
+    #[test]
+    fn suspicious_paths_are_flagged() {
+        for bad in [
+            "/a/query/../admin",
+            "/a/./b",
+            "/a//b",
+            "/a/%2e%2e/b",
+            "/a/%2E%2E/b",
+            "/a/.%2e/b",
+            "/a/%2e/b",
+        ] {
+            assert!(path_is_suspicious(bad), "{bad} should be suspicious");
+        }
+        for ok in ["/", "/a/b", "/a.b/c", "/a/b.json", "/a/..b", "/a/b%2ec"] {
+            assert!(!path_is_suspicious(ok), "{ok} should be fine");
+        }
     }
 
     #[test]

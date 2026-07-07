@@ -2,16 +2,16 @@ use std::{env, sync::Arc};
 
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::Context;
+use serde_json::json;
 use x402_chain_eip155::V2Eip155ExactClient;
 use x402_reqwest::{ReqwestWithPayments, ReqwestWithPaymentsBuild, X402Client};
 
-/// Proves the rules-driven paid loop end to end against the gateway:
-/// - free gateway route          -> 200, no payment
-/// - free proxied route          -> 200, no payment
-/// - paid route without payment  -> 402 + requirements
-/// - paid route with x402 signer -> sign, retry, 200 + settlement header
-/// - same route as caller with a per-caller price -> cheaper payment
-/// - unmatched route             -> 404, never proxied
+/// Proves pay-per-query search end to end against the gateway:
+/// - gateway + origin health stay free
+/// - a Firn full-text search without payment -> 402 + requirements
+/// - the same search paid via x402 -> 200 + ranked results
+/// - the same search as tenant-a -> cheaper per-caller price
+/// - admin routes (upsert) are not reachable through the gateway
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let gateway = env::var("GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
@@ -22,62 +22,117 @@ async fn main() -> anyhow::Result<()> {
     println!("client signer: {}", signer.address());
 
     let plain = reqwest::Client::new();
+    let search = json!({
+        "text": "gasless payments without ETH",
+        "k": 3,
+        "include_vector": false
+    });
+    let query_url = format!("{gateway}/firn/ns/demo/query");
 
-    // 1. Free route answered by the gateway itself.
-    let res = plain.get(format!("{gateway}/healthz")).send().await?;
-    println!("GET /healthz -> {}", res.status());
-    anyhow::ensure!(res.status().is_success(), "free gateway route failed");
+    // 1. Free routes: the gateway's own health and Firn's, proxied.
+    for path in ["/healthz", "/firn/health"] {
+        let res = plain.get(format!("{gateway}{path}")).send().await?;
+        println!("GET {path} -> {}", res.status());
+        anyhow::ensure!(res.status().is_success(), "free route {path} failed");
+    }
 
-    // 2. Free route proxied to the origin: no 402 involved.
-    let res = plain.get(format!("{gateway}/firn/metrics")).send().await?;
-    println!("GET /firn/metrics (free, proxied) -> {}", res.status());
-    anyhow::ensure!(res.status().is_success(), "free proxied route failed");
-
-    // 3. Paid route without payment: expect 402 + payment requirements.
-    let res = plain.get(format!("{gateway}/firn/health")).send().await?;
+    // 2. Search without payment: expect 402 + payment requirements.
+    let res = plain.post(&query_url).json(&search).send().await?;
     let status = res.status();
-    let requirements = header(&res, "payment-required");
-    println!("GET /firn/health (no payment) -> {status}");
-    println!("  payment-required (base64): {}", requirements.as_deref().unwrap_or("<missing>"));
+    println!("POST /firn/ns/demo/query (no payment) -> {status}");
+    println!(
+        "  payment-required (base64): {}",
+        header(&res, "payment-required").as_deref().unwrap_or("<missing>")
+    );
     anyhow::ensure!(
         status == reqwest::StatusCode::PAYMENT_REQUIRED,
         "expected 402 without payment, got {status}"
     );
 
-    // 4. Paid route through x402-reqwest: signs an EIP-3009 authorization and
-    //    retries automatically on 402.
+    // 3. The same search, paid: sign EIP-3009, retry, ranked results.
     let x402 = X402Client::new().register(V2Eip155ExactClient::new(Arc::new(signer)));
     let paying = reqwest::Client::new().with_payments(x402).build();
-    let res = paying.get(format!("{gateway}/firn/health")).send().await?;
-    let status = res.status();
-    let settlement = header(&res, "payment-response");
-    println!("GET /firn/health (x402, base price) -> {status}");
-    println!("  body: {}", res.text().await?);
-    println!("  payment-response (base64): {}", settlement.as_deref().unwrap_or("<missing>"));
-    anyhow::ensure!(status.is_success(), "paid request failed with {status}");
-
-    // 5. Same route as tenant-a, which the rules table prices lower.
+    // reqwest-middleware's builder has no .json() without an extra feature;
+    // set the body by hand to avoid the dependency.
     let res = paying
-        .get(format!("{gateway}/firn/health"))
-        .header("x-sluice-caller", "tenant-a")
+        .post(&query_url)
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&search)?)
         .send()
         .await?;
     let status = res.status();
     let settlement = header(&res, "payment-response");
-    println!("GET /firn/health (x402, caller tenant-a) -> {status}");
-    println!("  payment-response (base64): {}", settlement.as_deref().unwrap_or("<missing>"));
-    anyhow::ensure!(status.is_success(), "per-caller paid request failed with {status}");
-
-    // 6. A path no rule covers is refused, not proxied.
-    let res = plain.get(format!("{gateway}/not-a-route")).send().await?;
-    println!("GET /not-a-route -> {}", res.status());
+    let body: serde_json::Value = res.json().await?;
+    println!("POST /firn/ns/demo/query (x402, base price) -> {status}");
+    print_hits(&body);
+    println!(
+        "  payment-response (base64): {}",
+        settlement.as_deref().unwrap_or("<missing>")
+    );
+    anyhow::ensure!(status.is_success(), "paid search failed with {status}");
     anyhow::ensure!(
-        res.status() == reqwest::StatusCode::NOT_FOUND,
-        "unmatched route should 404"
+        !body["results"].as_array().map(Vec::is_empty).unwrap_or(true),
+        "paid search returned no results"
     );
 
-    println!("rules-driven paid loop OK");
+    // 4. Same search as tenant-a, which the rules table prices lower.
+    let res = paying
+        .post(&query_url)
+        .header("x-sluice-caller", "tenant-a")
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&search)?)
+        .send()
+        .await?;
+    let status = res.status();
+    println!("POST /firn/ns/demo/query (x402, caller tenant-a) -> {status}");
+    println!(
+        "  payment-response (base64): {}",
+        header(&res, "payment-response").as_deref().unwrap_or("<missing>")
+    );
+    anyhow::ensure!(status.is_success(), "per-caller paid search failed with {status}");
+
+    // 5. Admin writes are not exposed: no rule covers upsert.
+    let res = plain
+        .post(format!("{gateway}/firn/ns/demo/upsert"))
+        .json(&json!({"rows": []}))
+        .send()
+        .await?;
+    println!("POST /firn/ns/demo/upsert -> {}", res.status());
+    anyhow::ensure!(
+        res.status() == reqwest::StatusCode::NOT_FOUND,
+        "admin route should 404 through the gateway"
+    );
+
+    // 6. Path traversal under the paid prefix must be rejected, not priced
+    //    and normalized into an admin route by downstream URL parsing.
+    let res = plain
+        .post(format!("{gateway}/firn/ns/demo/query/../upsert"))
+        .json(&json!({"rows": []}))
+        .send()
+        .await?;
+    println!("POST /firn/ns/demo/query/../upsert -> {}", res.status());
+    anyhow::ensure!(
+        res.status() == reqwest::StatusCode::BAD_REQUEST
+            || res.status() == reqwest::StatusCode::NOT_FOUND,
+        "traversal path should be refused, got {}",
+        res.status()
+    );
+
+    println!("pay-per-query search OK");
     Ok(())
+}
+
+fn print_hits(body: &serde_json::Value) {
+    if let Some(results) = body["results"].as_array() {
+        for hit in results {
+            let text = hit["text"].as_str().unwrap_or("<no text>");
+            let text: String = text.chars().take(70).collect();
+            println!(
+                "  hit id={} score={:.3} {}…",
+                hit["id"], hit["score"].as_f64().unwrap_or(0.0), text
+            );
+        }
+    }
 }
 
 fn header(res: &reqwest::Response, name: &str) -> Option<String> {

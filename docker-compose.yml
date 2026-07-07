@@ -99,6 +99,21 @@ services:
       FIRNFLOW_BIND: "0.0.0.0:3000"
       RUST_LOG: info
 
+  seed-firn:
+    # One-shot: seed the demo namespace with text rows (direct to Firn;
+    # admin writes are not exposed through the gateway).
+    image: curlimages/curl:latest
+    container_name: sluice-seed-firn
+    depends_on:
+      - firnflow
+    volumes:
+      - ./scripts/seed-firn.sh:/seed-firn.sh:ro
+      - ./config/seed.json:/seed.json:ro
+    entrypoint: ["/bin/sh", "/seed-firn.sh"]
+    environment:
+      FIRN_URL: http://firnflow:3000
+      NAMESPACE: demo
+
   gateway:
     build:
       context: .

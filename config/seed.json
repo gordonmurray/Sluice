@@ -1,0 +1,84 @@
+{
+  "rows": [
+    {
+      "id": 1,
+      "text": "x402 is an open protocol for HTTP-native payments: a server answers 402 Payment Required with machine-readable requirements and the client retries with a signed payment.",
+      "vector": [
+        0.0,
+        0.1,
+        0.2,
+        0.3
+      ]
+    },
+    {
+      "id": 2,
+      "text": "EIP-3009 transferWithAuthorization lets a USDC holder sign a transfer off-chain; anyone can broadcast it, so the payer needs no ETH for gas.",
+      "vector": [
+        0.1,
+        0.2,
+        0.3,
+        0.4
+      ]
+    },
+    {
+      "id": 3,
+      "text": "A facilitator verifies signed payment authorizations and settles them on-chain. It never holds customer funds; the authorization is bound to amount, recipient, and validity window.",
+      "vector": [
+        0.2,
+        0.3,
+        0.4,
+        0.5
+      ]
+    },
+    {
+      "id": 4,
+      "text": "Sluice is a pay-per-request gateway: it prices routes from a rules table and forwards to the origin only after payment settles.",
+      "vector": [
+        0.3,
+        0.4,
+        0.5,
+        0.6
+      ]
+    },
+    {
+      "id": 5,
+      "text": "USDC on Base uses six decimal places, so 10000 atomic units equal one cent.",
+      "vector": [
+        0.4,
+        0.5,
+        0.6,
+        0.0
+      ]
+    },
+    {
+      "id": 6,
+      "text": "Full-text search ranks documents with BM25; hybrid search fuses BM25 and vector similarity using reciprocal rank fusion.",
+      "vector": [
+        0.5,
+        0.6,
+        0.0,
+        0.1
+      ]
+    },
+    {
+      "id": 7,
+      "text": "An API gateway terminates client connections, applies policy such as pricing or quotas, and reverse-proxies requests to backend origins.",
+      "vector": [
+        0.6,
+        0.0,
+        0.1,
+        0.2
+      ]
+    },
+    {
+      "id": 8,
+      "text": "Anvil can fork a live chain so contracts like USDC run locally against real state with fake value.",
+      "vector": [
+        0.0,
+        0.1,
+        0.2,
+        0.3
+      ]
+    }
+  ]
+}

@@ -1,7 +1,8 @@
 {
   "rules": [
     { "prefix": "/firn/metrics", "pricing": "free" },
-    { "prefix": "/firn/health", "price_usdc": "0.01",
-      "caller_prices": { "tenant-a": "0.002" } }
+    { "prefix": "/firn/health", "pricing": "free" },
+    { "prefix": "/firn/ns/demo/query", "price_usdc": "0.05",
+      "caller_prices": { "tenant-a": "0.02" } }
   ]
 }
