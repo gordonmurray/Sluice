@@ -3,13 +3,14 @@
 A self-hostable, pay-per-request gateway. Sluice sits in front of any HTTP
 origin and enforces payment before forwarding the request: no payment gets a
 `402 Payment Required` with machine-readable payment requirements; a signed
-USDC payment gets verified, settled on-chain, and proxied through — all in one
-round trip retry.
+USDC payment gets verified, settled on-chain, and proxied through — one retry.
 
-Payments use the [x402 protocol](https://www.x402.org) (gasless EIP-3009 USDC
-transfers on Base). The gateway itself never touches the chain: a
+Payments use the [x402 protocol](https://www.x402.org)'s `exact` scheme with
+USDC on Base via EIP-3009 — gasless for the client, who signs off-chain and
+never needs ETH. The gateway process never submits chain transactions: a
 [facilitator](https://github.com/x402-rs/x402-rs) verifies the client's signed
-authorization and broadcasts the settlement.
+authorization and broadcasts the settlement (paying the gas). Sluice settles
+*before* forwarding, so the origin never does unpaid work.
 
 ```
 client ──► gateway (axum + x402-axum) ──► origin (any HTTP service)
@@ -25,7 +26,7 @@ is pluggable — anything that speaks HTTP can be metered.
 ## How a paid request works
 
 1. `GET /firn/health` with no payment → `402` + a `payment-required` header
-   describing price, asset (USDC), network, and pay-to address.
+   (base64-encoded x402 requirements: price, asset, network, pay-to address).
 2. The client signs an EIP-3009 `transferWithAuthorization` for exactly that
    amount — off-chain, no gas — and retries with a `Payment-Signature` header.
 3. The gateway asks the facilitator to verify (and settle) the authorization
@@ -33,13 +34,14 @@ is pluggable — anything that speaks HTTP can be metered.
 4. The response carries a `payment-response` header with the settlement
    transaction hash.
 
-The client pays per request; the operator receives USDC; nobody holds custody
-of anything in between.
+The client pays per request; the operator receives USDC; the facilitator in
+between never takes custody — the signed authorization is bound to the exact
+token, amount, recipient, validity window, and nonce.
 
 ## Quickstart (local, no real money)
 
-Everything runs in docker. Anvil forks Base mainnet, so the real USDC contract
-behaves correctly locally with fake value.
+Everything runs in docker. Anvil forks Base mainnet, so the real USDC bytecode
+runs against real forked state locally — with no real-money settlement.
 
 ```sh
 docker compose up -d --build     # anvil fork, facilitator, minio, firn, gateway
@@ -82,10 +84,6 @@ All keys in `docker-compose.yml` are fake-value dev keys for the local fork.
 | 5 | Observability: OTel + Grafana | — |
 | 6 | Base Sepolia smoke test | — |
 
-Built local-first: rung 1 is the offline anvil loop above, rung 2 swaps in
+Built local-first: rung 1 is the offline anvil loop above, rung 2 will swap in
 Base Sepolia (`docker-compose.testnet.yml`), rung 3 is production on ECS with
 real USDC on Base mainnet.
-
-## License
-
-Apache-2.0
