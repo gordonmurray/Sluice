@@ -43,6 +43,15 @@ token, amount, recipient, validity window, and nonce.
 Everything runs in docker. Anvil forks Base mainnet, so the real USDC bytecode
 runs against real forked state locally — with no real-money settlement.
 
+The demo origin, [Firn](https://github.com/gordonmurray/firnflow), builds from
+a sibling checkout:
+
+```sh
+git clone https://github.com/gordonmurray/sluice
+git clone https://github.com/gordonmurray/firnflow   # next to sluice/
+cd sluice
+```
+
 ```sh
 docker compose up -d --build     # anvil fork, facilitator, minio, firn, gateway
 curl -i localhost:8080/healthz     # 200 — free route
@@ -67,23 +76,12 @@ All keys in `docker-compose.yml` are fake-value dev keys for the local fork.
 |---|---|
 | `gateway/` | axum reverse proxy with x402-axum payment enforcement |
 | `client/` | test client over x402-reqwest; proves the paid loop |
-| `rules/` | route/caller → price policy (milestone 2) |
-| `indexer/` | settlement receipts → Postgres (milestone 4) |
-| `config/` | mounted service configs (facilitator) |
-| `scripts/` | USDC funding on the fork, dockerized cargo |
-| `docs/` | one note per milestone: what was built, what surprised |
+| `rules/` | route/caller → price policy, table-driven |
+| `indexer/` | settlement receipts → Postgres |
+| `config/` | mounted service configs, rules table, Grafana provisioning |
+| `scripts/` | USDC funding on the fork, Firn seeding, dockerized cargo |
+| `docs/` | build notes and [gotchas](docs/gotchas.md) hit along the way |
 
-## Status
-
-| Milestone | | |
-|---|---|---|
-| 1 | One paid request end to end (anvil fork) | ✅ [notes](docs/milestone-1.md) |
-| 2 | Rules layer: route/caller → price | ✅ [notes](docs/milestone-2.md) |
-| 3 | Firn flagship demo: pay-per-query search | ✅ [notes](docs/milestone-3.md) |
-| 4 | Payments indexer → Postgres | ✅ [notes](docs/milestone-4.md) |
-| 5 | Observability: OTel + Grafana | ✅ [notes](docs/milestone-5.md) |
-| 6 | Base Sepolia smoke test | ⏸ [what it needs](docs/rung-2.md) |
-
-Built local-first: rung 1 is the offline anvil loop above, rung 2 will swap in
-Base Sepolia (`docker-compose.testnet.yml`), rung 3 is production on ECS with
-real USDC on Base mainnet.
+Built local-first: the offline anvil loop above is the primary dev
+environment. Base Sepolia comes next ([what that needs](docs/rung-2.md)),
+then production with real USDC on Base mainnet.
