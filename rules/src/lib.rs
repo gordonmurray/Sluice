@@ -7,7 +7,10 @@
 //! This module is deliberately ignorant of x402, chains, and assets: prices
 //! are plain micro-USDC amounts (6 decimals, the token's atomic unit) and the
 //! gateway translates them into payment requirements. Matching is
-//! longest-prefix-wins; anything unmatched is denied.
+//! longest-prefix-wins on the raw path bytes — no decoding, no
+//! normalisation (the gateway rejects percent-encoded paths before they
+//! reach this crate); anything unmatched is denied. `/firn` and `/firn/`
+//! are distinct paths but both match a `/firn` prefix.
 //!
 //! ```json
 //! {
@@ -301,6 +304,29 @@ mod tests {
         assert_eq!(
             ruleset().decide("/firn", None),
             Decision::Paid { micro_usdc: 50_000 }
+        );
+    }
+
+    #[test]
+    fn trailing_slash_prices_like_the_bare_path() {
+        assert_eq!(
+            ruleset().decide("/firn/", None),
+            Decision::Paid { micro_usdc: 50_000 }
+        );
+        assert_eq!(
+            ruleset().decide("/firn/health/", None),
+            Decision::Paid { micro_usdc: 10_000 }
+        );
+    }
+
+    #[test]
+    fn encoded_alias_of_a_rule_does_not_match_it() {
+        // Byte-exact matching: `%68ealth` is not `health`, so the longer
+        // rule does not apply. (The gateway rejects such paths outright;
+        // this pins the fail-closed behaviour if one ever got here.)
+        assert_ne!(
+            ruleset().decide("/firn/%68ealth", None),
+            Decision::Paid { micro_usdc: 10_000 }
         );
     }
 

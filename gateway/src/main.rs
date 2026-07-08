@@ -273,17 +273,48 @@ fn report_settlement(
     });
 }
 
-/// Rules match the raw request path, but URL parsers downstream normalize
-/// dot segments — so `/a/query/../admin` would be priced as `/a/query` and
-/// delivered to the origin as `/a/admin`. Refuse anything that could
-/// normalize into a different path: dot segments (plain or percent-encoded)
-/// and empty segments.
+/// Path canonicalisation policy: match raw, forward raw, reject ambiguity.
+///
+/// Rules match the request path byte-for-byte and the origin receives it
+/// unmodified. The gateway never decodes or normalises — any rewrite would be
+/// a second interpretation of the path that can disagree with the origin's,
+/// and the two disagreeing is exactly how a request gets priced as one route
+/// and served as another.
+///
+/// The flip side: anything the origin might interpret differently than the
+/// raw bytes the rules matched is rejected up front (400, no price tag):
+///
+/// - Percent-encoding, in any case. An origin that decodes `%2F` turns one
+///   segment into two (`/a%2F..%2Fadmin` becomes `/a/../admin`), and an
+///   encoded alias like `/firn/%68ealth` would be priced by the `/firn` rule
+///   while the origin serves `/firn/health` — a cheaper prefix buying a more
+///   expensive route. Rejecting `%` outright closes the whole class, encoded
+///   dot segments and mixed-case variants included. HTTP request paths are
+///   ASCII on the wire, so this also means no unicode ever reaches matching
+///   and normalisation questions cannot arise.
+/// - Backslashes: some origins treat `\` as `/`.
+/// - Semicolons: servlet-style origins strip `;matrix=params` before
+///   routing, so `/firn/health;v=1` would be priced by the shorter `/firn`
+///   rule (it does not byte-match `/firn/health`) and served as
+///   `/firn/health`.
+/// - Dot segments and empty segments: URL parsers downstream collapse them,
+///   so `/a/query/../admin` would be priced as `/a/query` and delivered as
+///   `/a/admin`.
+///
+/// Trailing slashes are allowed and not equivalent: `/firn` and `/firn/` are
+/// forwarded as-is and are distinct paths to the origin, but both match a
+/// `/firn` rule (prefix matching is on whole segments), so they price the
+/// same.
+///
+/// "Forwarded as-is" has one deliberate exception: the configured
+/// `STRIP_PREFIX` removes a leading whole-segment prefix after pricing.
+/// Rules price the external path; the origin sees the stripped one.
 fn path_is_suspicious(path: &str) -> bool {
-    path.contains("//")
-        || path.split('/').any(|seg| {
-            let l = seg.to_ascii_lowercase();
-            matches!(l.as_str(), "." | ".." | "%2e" | "%2e%2e" | ".%2e" | "%2e.")
-        })
+    path.contains('%')
+        || path.contains('\\')
+        || path.contains(';')
+        || path.contains("//")
+        || path.split('/').any(|seg| matches!(seg, "." | ".."))
 }
 
 /// Strip `prefix` from `path` on whole-segment boundaries only: `/firn` is
@@ -353,17 +384,34 @@ mod tests {
     #[test]
     fn suspicious_paths_are_flagged() {
         for bad in [
+            // dot segments, plain and percent-encoded
             "/a/query/../admin",
             "/a/./b",
-            "/a//b",
             "/a/%2e%2e/b",
             "/a/%2E%2E/b",
             "/a/.%2e/b",
             "/a/%2e/b",
+            // empty segments
+            "/a//b",
+            // percent-encoding anywhere, any case, decodable or not
+            "/a%2Fb",
+            "/a%2fb",
+            "/a/%68ealth",
+            "/a/b%2ec",
+            "/a/b%20c",
+            "/a/%zz",
+            // backslashes, raw and encoded
+            "/a\\b",
+            "/a%5Cb",
+            "/a%5cb",
+            // semicolons: matrix-param stripping origins reroute these
+            "/firn/health;v=1",
+            "/firn/health/;v=1",
+            "/firn;v=1/health",
         ] {
             assert!(path_is_suspicious(bad), "{bad} should be suspicious");
         }
-        for ok in ["/", "/a/b", "/a.b/c", "/a/b.json", "/a/..b", "/a/b%2ec"] {
+        for ok in ["/", "/a/b", "/a.b/c", "/a/b.json", "/a/..b", "/a/b/", "/a-b_c~d/e"] {
             assert!(!path_is_suspicious(ok), "{ok} should be fine");
         }
     }
