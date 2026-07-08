@@ -1983,6 +1983,8 @@ dependencies = [
  "alloy-primitives",
  "anyhow",
  "axum",
+ "base64",
+ "bytes",
  "reqwest",
  "rules",
  "serde_json",

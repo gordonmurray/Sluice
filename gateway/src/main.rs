@@ -129,9 +129,35 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let state = Arc::new(AppState {
+        origin: origin.trim_end_matches('/').to_string(),
+        strip_prefix,
+        http: build_http_client(origin_timeout),
+        rules,
+        pay_to: format!("{pay_to}"),
+        indexer_url,
+        indexer_token,
+    });
+
+    let app = build_app(state, &facilitator_url, pay_to)?;
+
+    tracing::info!(%bind, %origin, %facilitator_url, %pay_to, %rules_path, "sluice gateway starting");
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// The full request-handling stack, exactly as served: stamp_decision
+/// (outermost), the x402 payment layer, then the proxy handler. Factored out
+/// of main so the integration tests drive the same stack production runs.
+fn build_app(
+    state: Arc<AppState>,
+    facilitator_url: &str,
+    pay_to: Address,
+) -> anyhow::Result<Router> {
     // Settle before forwarding: the origin never does unpaid work, and the
     // settlement lands in the request extensions for the indexer.
-    let x402 = X402Middleware::try_from(facilitator_url.clone())
+    let x402 = X402Middleware::try_from(facilitator_url.to_string())
         .map_err(|e| anyhow::anyhow!("invalid FACILITATOR_URL: {e}"))?
         .settle_before_execution();
 
@@ -158,19 +184,9 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let state = Arc::new(AppState {
-        origin: origin.trim_end_matches('/').to_string(),
-        strip_prefix,
-        http: build_http_client(origin_timeout),
-        rules,
-        pay_to: format!("{pay_to}"),
-        indexer_url,
-        indexer_token,
-    });
-
     // Layer order (outermost first): stamp_decision, x402, proxy — the
     // stamp must exist before the x402 layer prices the request.
-    let app = Router::new()
+    Ok(Router::new()
         .route("/healthz", get(healthz))
         .fallback_service(
             any(proxy)
@@ -181,12 +197,7 @@ async fn main() -> anyhow::Result<()> {
                 ))
                 .with_state(state.clone()),
         )
-        .with_state(state);
-
-    tracing::info!(%bind, %origin, %facilitator_url, %pay_to, %rules_path, "sluice gateway starting");
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(state))
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -667,6 +678,286 @@ mod tests {
         // Recovery: fixing the file swaps the fix in.
         assert_eq!(r.apply(table("0.05").into_bytes()), Ok(true));
         assert_eq!(price_of(&shared), Decision::Paid { micro_usdc: 50_000 });
+    }
+
+    // ---- integration harness: the full stack against a mock origin ----
+
+    type OriginLog = Arc<std::sync::Mutex<Vec<(String, HeaderMap)>>>;
+
+    /// A real HTTP origin (the proxy speaks reqwest, not tower) that records
+    /// every request it sees and answers with deliberately hop-by-hop-laden
+    /// headers so response-direction stripping is observable.
+    async fn mock_origin() -> (String, OriginLog) {
+        let log: OriginLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let app = Router::new().fallback(move |req: Request| {
+            let log = log2.clone();
+            async move {
+                log.lock()
+                    .unwrap()
+                    .push((req.uri().path().to_string(), req.headers().clone()));
+                (
+                    [
+                        ("connection", "x-resp-hop"),
+                        ("x-resp-hop", "should-not-escape"),
+                        ("keep-alive", "timeout=5"),
+                        ("x-origin-header", "kept"),
+                    ],
+                    "origin says hi",
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), log)
+    }
+
+    const ITEST_TABLE: &str = r#"{ "rules": [
+        { "prefix": "/free", "pricing": "free" },
+        { "prefix": "/paid", "price_usdc": "0.05",
+          "caller_prices": { "tenant-a": "0.002" } }
+    ] }"#;
+
+    /// The production stack via build_app: stamp middleware, x402 layer
+    /// (facilitator unreachable — nothing here pays successfully), proxy.
+    async fn full_app() -> (Router, OriginLog) {
+        let (origin, log) = mock_origin().await;
+        let state = Arc::new(AppState {
+            origin,
+            strip_prefix: None,
+            http: build_http_client(5),
+            rules: Arc::new(RwLock::new(Arc::new(
+                RuleSet::from_json(ITEST_TABLE).unwrap(),
+            ))),
+            pay_to: "0xpayto".into(),
+            indexer_url: None,
+            indexer_token: None,
+        });
+        let app = build_app(state, "http://127.0.0.1:1", Address::ZERO).unwrap();
+        (app, log)
+    }
+
+    async fn send(
+        app: Router,
+        req: axum::http::Request<Body>,
+    ) -> (StatusCode, axum::http::HeaderMap, bytes::Bytes) {
+        use tower::ServiceExt;
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, headers, body)
+    }
+
+    fn advertised_amount(headers: &axum::http::HeaderMap) -> String {
+        use base64::Engine;
+        let b64 = headers
+            .get("payment-required")
+            .expect("402 must advertise payment requirements")
+            .to_str()
+            .unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        v["accepts"][0]["amount"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn denied_paths_never_reach_the_origin() {
+        let (app, log) = full_app().await;
+
+        // No rule covers /other.
+        let (status, _, _) = send(
+            app.clone(),
+            axum::http::Request::builder()
+                .uri("/other")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Same with a payment attached: a denied path gets no price tag, so
+        // the payment must be ignored, not redeemed for access.
+        let (status, _, _) = send(
+            app.clone(),
+            axum::http::Request::builder()
+                .uri("/other")
+                .header(
+                    "payment-signature",
+                    "eyJ4NDAyVmVyc2lvbiI6MiwicGF5bG9hZCI6Imp1bmsifQ==",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Suspicious paths are refused outright.
+        let (status, _, _) = send(
+            app.clone(),
+            axum::http::Request::builder()
+                .uri("/paid/../free")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "denied requests must not touch the origin: {:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn free_routes_are_proxied_without_payment_headers() {
+        let (app, log) = full_app().await;
+        let (status, headers, body) = send(
+            app,
+            axum::http::Request::builder()
+                .uri("/free/thing")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"origin says hi");
+        assert!(
+            headers.get("payment-required").is_none(),
+            "free routes must not demand payment"
+        );
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn paid_routes_advertise_exactly_the_rules_amount() {
+        let (app, log) = full_app().await;
+
+        // Base price: 0.05 USDC = 50000 micro.
+        let (status, headers, _) = send(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/paid/q")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(advertised_amount(&headers), "50000");
+
+        // Per-caller price: 0.002 USDC = 2000 micro.
+        let (status, headers, _) = send(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/paid/q")
+                .header(CALLER_HEADER, "tenant-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(advertised_amount(&headers), "2000");
+
+        // Unknown callers pay the base price.
+        let (status, headers, _) = send(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/paid/q")
+                .header(CALLER_HEADER, "tenant-nobody")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(advertised_amount(&headers), "50000");
+
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "unpaid requests to paid routes must not touch the origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_bodies_get_413_without_touching_the_origin() {
+        let (app, log) = full_app().await;
+        let (status, _, _) = send(
+            app,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/free/upload")
+                .body(Body::from(vec![0u8; MAX_BODY_BYTES + 1]))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hop_by_hop_headers_are_stripped_in_both_directions() {
+        let (app, log) = full_app().await;
+        let (status, resp_headers, _) = send(
+            app,
+            axum::http::Request::builder()
+                .uri("/free/echo")
+                .header("connection", "x-req-hop")
+                .header("x-req-hop", "should-not-arrive")
+                .header("proxy-authorization", "Basic c2Vrcml0")
+                .header("te", "trailers")
+                .header(CALLER_HEADER, "tenant-a")
+                .header("x-req-keep", "kept")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Request direction: what the origin actually received.
+        let origin_headers = {
+            let log = log.lock().unwrap();
+            assert_eq!(log.len(), 1);
+            log[0].1.clone()
+        };
+        for gone in [
+            "connection",
+            "x-req-hop", // nominated by Connection
+            "proxy-authorization",
+            "te",
+            CALLER_HEADER,   // gateway-internal pricing hint
+            DECISION_HEADER, // gateway-internal decision stamp
+        ] {
+            assert!(
+                origin_headers.get(gone).is_none(),
+                "{gone} must not reach the origin"
+            );
+        }
+        assert_eq!(
+            origin_headers
+                .get("x-req-keep")
+                .and_then(|v| v.to_str().ok()),
+            Some("kept")
+        );
+
+        // Response direction: what the client got back.
+        for gone in ["connection", "keep-alive", "x-resp-hop"] {
+            assert!(
+                resp_headers.get(gone).is_none(),
+                "{gone} must not reach the client"
+            );
+        }
+        assert_eq!(
+            resp_headers
+                .get("x-origin-header")
+                .and_then(|v| v.to_str().ok()),
+            Some("kept")
+        );
     }
 
     type ReceiptRx = tokio::sync::mpsc::Receiver<(Option<String>, serde_json::Value)>;
