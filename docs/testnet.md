@@ -52,5 +52,7 @@ exist).
 - The indexer's `/receipts` endpoint requires the `INDEXER_TOKEN` shared
   secret (compose ships a dev-only value; use a real secret off-machine).
 - Settle-before-execution means a client can pay for a request the origin
-  then fails; decide the refund/retry policy.
+  then fails; the policy is no auto-retry/refund, with the outcome recorded
+  in the payments table for operator-driven refunds (see
+  [paid-but-failed.md](paid-but-failed.md)).
 - Grafana and Postgres credentials are compose-local defaults.
