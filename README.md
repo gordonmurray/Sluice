@@ -1,5 +1,7 @@
 # Sluice
 
+[![ci](https://github.com/gordonmurray/Sluice/actions/workflows/ci.yml/badge.svg)](https://github.com/gordonmurray/Sluice/actions/workflows/ci.yml)
+
 Sluice is a self-hostable, pay-per-request gateway. It sits in front of any
 HTTP origin and enforces payment before forwarding the request: no payment
 gets a `402 Payment Required` with machine-readable requirements, and a
