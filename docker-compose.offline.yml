@@ -1,0 +1,66 @@
+# Fully offline dev loop: no fork, no internet needed once images are pulled.
+# Anvil runs a fresh chain with Base's chain id (so the facilitator config is
+# unchanged) and a minimal EIP-3009 token stands in for USDC, mirroring its
+# EIP-712 domain fields ("USD Coin", "2", 8453) so gateway and facilitator
+# defaults hold. The payment flow is identical; signatures are chain-local.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.offline.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.offline.yml run --rm client
+#
+# The token is pre-compiled (contracts/MockUSDC.bin, source alongside) and
+# deployed with cast, so no compiler and no network at stack-up. It deploys
+# from anvil dev account #3 at nonce 0, making its address deterministic:
+# 0x057ef64E23666F000b34aE31332854aCBd1c8544.
+
+services:
+  anvil:
+    # No --fork-url: nothing here ever dials out. --block-time still matters
+    # (EIP-3009 validAfter needs advancing chain time).
+    command:
+      - "anvil --host 0.0.0.0 --chain-id 8453 --block-time 5"
+
+  deploy-token:
+    # One-shot: put the mock token on the fresh chain before anything pays.
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: sluice-deploy-token
+    depends_on:
+      anvil:
+        condition: service_healthy
+    volumes:
+      - ./contracts/MockUSDC.bin:/MockUSDC.bin:ro
+      - ./contracts/SignatureValidator.bin:/SignatureValidator.bin:ro
+      - ./contracts/Permit2.bin:/Permit2.bin:ro
+      - ./contracts/X402Sponsor.bin:/X402Sponsor.bin:ro
+      - ./scripts/deploy-mock.sh:/deploy-mock.sh:ro
+    environment:
+      RPC: http://anvil:8545
+      TOKEN_ADDRESS: "0x057ef64E23666F000b34aE31332854aCBd1c8544"
+      # anvil dev account #3: publicly known key, fake value only. Reserved
+      # for deployment so its nonce-0 CREATE address stays deterministic.
+      DEPLOYER_KEY: "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6"
+    command:
+      - "sh /deploy-mock.sh"
+
+  facilitator:
+    # The signature validator must be on-chain before the facilitator's
+    # startup check runs.
+    depends_on:
+      deploy-token:
+        condition: service_completed_successfully
+
+  fund-usdc:
+    depends_on:
+      deploy-token:
+        condition: service_completed_successfully
+    volumes:
+      - ./scripts/fund-mock.sh:/fund-mock.sh:ro
+    environment:
+      TOKEN_ADDRESS: "0x057ef64E23666F000b34aE31332854aCBd1c8544"
+    command:
+      - "sh /fund-mock.sh"
+
+  gateway:
+    environment:
+      # Everything else (name/version/decimals/chain id) defaults to the
+      # USDC-on-Base values, which the mock token mirrors.
+      ASSET_ADDRESS: "0x057ef64E23666F000b34aE31332854aCBd1c8544"

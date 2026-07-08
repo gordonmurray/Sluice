@@ -17,7 +17,10 @@ use axum::{
 };
 use rules::{Decision, RuleSet};
 use x402_axum::X402Middleware;
-use x402_chain_eip155::{KnownNetworkEip155, V2Eip155Exact};
+use x402_chain_eip155::{
+    KnownNetworkEip155, V2Eip155Exact,
+    chain::{AssetTransferMethod, Eip155ChainReference, Eip155TokenDeployment},
+};
 use x402_types::networks::USDC;
 use x402_types::proto::SettleResponse;
 
@@ -235,12 +238,52 @@ async fn main() -> anyhow::Result<()> {
         indexer_token,
     });
 
-    let app = build_app(state, &facilitator_url, pay_to)?;
+    let asset = asset_from_env()?;
+    tracing::info!(address = %asset.address, decimals = asset.decimals, "payment asset");
+    let app = build_app(state, &facilitator_url, pay_to, asset)?;
 
     tracing::info!(%bind, %origin, %facilitator_url, %pay_to, %rules_path, "sluice gateway starting");
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// The payment asset the gateway demands. Defaults to the canonical USDC
+/// deployment on Base; setting ASSET_ADDRESS switches to any EIP-3009 token
+/// (offline dev deploys contracts/MockUSDC.sol and points here). ASSET_NAME
+/// and ASSET_VERSION must match the token's EIP-712 domain or every
+/// signature the client produces will be rejected on-chain; the defaults
+/// mirror USDC on Base ("USD Coin", "2"), which the mock reuses.
+fn asset_from_env() -> anyhow::Result<Eip155TokenDeployment> {
+    let Some(addr) = env::var("ASSET_ADDRESS").ok().filter(|s| !s.is_empty()) else {
+        return Ok(USDC::base());
+    };
+    let address: Address = addr
+        .parse()
+        .context("ASSET_ADDRESS is not a valid EVM address")?;
+    let name = env::var("ASSET_NAME").unwrap_or_else(|_| "USD Coin".to_string());
+    let version = env::var("ASSET_VERSION").unwrap_or_else(|_| "2".to_string());
+    let decimals: u8 = env::var("ASSET_DECIMALS")
+        .ok()
+        .map(|s| s.parse())
+        .transpose()
+        .context("ASSET_DECIMALS must be a small integer")?
+        .unwrap_or(6);
+    let chain_id: u64 = env::var("ASSET_CHAIN_ID")
+        .ok()
+        .map(|s| s.parse())
+        .transpose()
+        .context("ASSET_CHAIN_ID must be a numeric EVM chain id")?
+        .unwrap_or(8453);
+    Ok(Eip155TokenDeployment {
+        chain_reference: Eip155ChainReference::new(chain_id),
+        address,
+        decimals,
+        transfer_method: AssetTransferMethod::Eip3009 {
+            name: name.into(),
+            version: version.into(),
+        },
+    })
 }
 
 /// The full request-handling stack, exactly as served: stamp_decision
@@ -250,6 +293,7 @@ fn build_app(
     state: Arc<AppState>,
     facilitator_url: &str,
     pay_to: Address,
+    asset: Eip155TokenDeployment,
 ) -> anyhow::Result<Router> {
     // Settle before forwarding: the origin never does unpaid work, and the
     // settlement lands in the request extensions for the indexer.
@@ -262,18 +306,17 @@ fn build_app(
     // cannot price under one table and forward under another. Free and
     // denied requests get no price tag (the x402 layer then forwards them
     // untouched); denial is enforced by the proxy handler behind the layer.
-    let usdc = USDC::base();
     let pricer = move |headers: &axum::http::HeaderMap,
                        _uri: &axum::http::Uri,
                        _base: Option<&reqwest::Url>| {
         // Missing/undecodable stamp cannot happen behind the middleware;
         // fail closed (no price tag, handler denies) if it somehow does.
         let decision = decode_decision(headers.get(DECISION_HEADER)).unwrap_or(Decision::Deny);
-        let usdc = usdc.clone();
+        let asset = asset.clone();
         async move {
             match decision {
                 Decision::Paid { micro_usdc } => {
-                    vec![V2Eip155Exact::price_tag(pay_to, usdc.amount(micro_usdc))]
+                    vec![V2Eip155Exact::price_tag(pay_to, asset.amount(micro_usdc))]
                 }
                 Decision::Free | Decision::Deny => vec![],
             }
@@ -940,7 +983,7 @@ mod tests {
             indexer_url: None,
             indexer_token: None,
         });
-        let app = build_app(state, "http://127.0.0.1:1", Address::ZERO).unwrap();
+        let app = build_app(state, "http://127.0.0.1:1", Address::ZERO, USDC::base()).unwrap();
         (app, log)
     }
 
@@ -1189,7 +1232,7 @@ mod tests {
             indexer_url: None,
             indexer_token: None,
         });
-        let app = build_app(state, "http://127.0.0.1:1", Address::ZERO).unwrap();
+        let app = build_app(state, "http://127.0.0.1:1", Address::ZERO, USDC::base()).unwrap();
 
         let count = || {
             metrics()
