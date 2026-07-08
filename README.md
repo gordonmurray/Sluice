@@ -90,6 +90,20 @@ Prometheus metrics at `/metrics`; that path and `/healthz` are the gateway's
 own and are never proxied, though an origin's endpoints stay reachable under
 their prefix, e.g. `/firn/metrics`).
 
+No internet (or a flaky RPC)? The offline override skips the fork entirely:
+anvil runs a fresh chain with Base's chain id, and a minimal EIP-3009 token
+(`contracts/MockUSDC.sol`, pre-compiled so no compiler is needed) stands in
+for USDC, mirroring its EIP-712 domain fields (name, version, chain id —
+the verifying contract necessarily differs, so signatures are not portable
+between the forked and offline chains). The x402 infrastructure contracts the
+facilitator expects on-chain are installed from committed bytecode
+snapshots. Nothing dials out:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.offline.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.offline.yml run --rm client
+```
+
 To meter the real Firn instead of the built-in stand-in, clone it next to
 this repo and add the override:
 
