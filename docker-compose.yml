@@ -57,49 +57,18 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       OTEL_SERVICE_NAME: facilitator
 
-  minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
-    container_name: sluice-minio
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    volumes:
-      - minio-data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "mc ready local || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-  minio-init:
-    image: minio/mc:latest
-    container_name: sluice-minio-init
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb --ignore-existing local/firnflow
-      "
-
-  firnflow:
-    # Reference origin, built from the local checkout. Pluggable: any HTTP
-    # origin works (see CLAUDE.md scope guardrails).
+  origin:
+    # The metered origin. By default the built-in demo stand-in, so a fresh
+    # clone of this repo alone runs the full paid loop; docker-compose.firn.yml
+    # overrides this same service to build Firn instead (a true swap — same
+    # service name, so nothing extra runs or gates the gateway). Pluggable:
+    # any HTTP origin works (see CLAUDE.md scope guardrails).
     build:
-      context: ../firnflow
-      dockerfile: Dockerfile
-    container_name: sluice-firnflow
-    depends_on:
-      minio-init:
-        condition: service_completed_successfully
+      context: .
+    container_name: sluice-origin
+    entrypoint: ["/usr/local/bin/demo-origin"]
     environment:
-      FIRNFLOW_S3_ENDPOINT: http://minio:9000
-      FIRNFLOW_S3_ACCESS_KEY: minioadmin
-      FIRNFLOW_S3_SECRET_KEY: minioadmin
-      FIRNFLOW_S3_BUCKET: firnflow
-      FIRNFLOW_BIND: "0.0.0.0:3000"
+      BIND: "0.0.0.0:3000"
       RUST_LOG: info
 
   otel-collector:
@@ -164,28 +133,13 @@ services:
       INDEXER_TOKEN: sluice-dev-indexer-token
       RUST_LOG: info
 
-  seed-firn:
-    # One-shot: seed the demo namespace with text rows (direct to Firn;
-    # admin writes are not exposed through the gateway).
-    image: curlimages/curl:latest
-    container_name: sluice-seed-firn
-    depends_on:
-      - firnflow
-    volumes:
-      - ./scripts/seed-firn.sh:/seed-firn.sh:ro
-      - ./config/seed.json:/seed.json:ro
-    entrypoint: ["/bin/sh", "/seed-firn.sh"]
-    environment:
-      FIRN_URL: http://firnflow:3000
-      NAMESPACE: demo
-
   gateway:
     build:
       context: .
     container_name: sluice-gateway
     depends_on:
       - facilitator
-      - firnflow
+      - origin
       - indexer
     ports:
       - "8080:8080"
@@ -196,7 +150,7 @@ services:
       # one — defeating live reload. A directory mount resolves per access.
       - ./config:/app/config:ro
     environment:
-      ORIGIN_URL: http://firnflow:3000
+      ORIGIN_URL: http://origin:3000
       FACILITATOR_URL: http://facilitator:8080
       PAY_TO: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
       RULES_PATH: /app/config/rules.json
@@ -217,8 +171,6 @@ services:
     depends_on:
       gateway:
         condition: service_started
-      seed-firn:
-        condition: service_completed_successfully
       fund-usdc:
         condition: service_completed_successfully
     environment:
@@ -227,5 +179,4 @@ services:
       CLIENT_API_KEY: sluice-dev-key-tenant-a
 
 volumes:
-  minio-data:
   postgres-data:

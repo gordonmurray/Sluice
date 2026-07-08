@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["gateway", "rules", "client", "indexer"]
+members = ["gateway", "rules", "client", "indexer", "demo-origin"]
 
 [workspace.package]
 edition = "2024"

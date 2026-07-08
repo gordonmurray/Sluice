@@ -24,14 +24,17 @@ client ──► gateway (axum + x402-axum) ──► origin (any HTTP service)
            facilitator ──► Base (USDC, EIP-3009 transferWithAuthorization)
 ```
 
-The demo meters [Firn](https://github.com/gordonmurray/firnflow), a
-multi-tenant vector and full-text search engine, at $0.05 a query ($0.02 for
-one configured caller, authenticated by API key — `config/callers.json` maps
+The demo meters pay-per-query search at $0.05 a query ($0.02 for one
+configured caller, authenticated by API key — `config/callers.json` maps
 keys to caller ids, presented as `x-sluice-api-key`; unauthenticated caller
-claims are priced at the base rate). The origin is pluggable; any request/response HTTP
-service can be metered the same way (request bodies are capped at 10 MiB,
-and WebSockets and streaming uploads are not supported yet). Pricing is a
-table edit, not a code change.
+claims are priced at the base rate). Out of the box the origin is a small
+built-in search stand-in, so this repo alone runs the whole loop; the
+flagship demo meters [Firn](https://github.com/gordonmurray/firnflow), a
+multi-tenant vector and full-text search engine, via a compose override.
+The origin is pluggable; any request/response HTTP service can be metered
+the same way (request bodies are capped at 10 MiB, and WebSockets and
+streaming uploads are not supported yet). Pricing is a table edit, not a
+code change.
 
 ## How a paid request works
 
@@ -55,16 +58,16 @@ Everything runs in docker. Anvil forks Base mainnet, so the real USDC
 bytecode runs against real forked state locally, with no real-money
 settlement.
 
-The demo origin, Firn, builds from a sibling checkout:
+A fresh clone of this repo is all you need — the default origin is the
+built-in demo search service:
 
 ```sh
 git clone https://github.com/gordonmurray/sluice
-git clone https://github.com/gordonmurray/firnflow   # next to sluice/
 cd sluice
 ```
 
 ```sh
-docker compose up -d --build                # the whole stack, seeded and funded
+docker compose up -d --build                # the whole stack; corpus built in, client funded
 curl -i localhost:8080/healthz              # 200, free
 curl -i -X POST localhost:8080/firn/ns/demo/query   # 402 + payment requirements
 docker compose run --rm client              # 402 -> sign -> retry -> 200
@@ -83,8 +86,17 @@ decimals), so the pay-to balance grows by 70000 per run. The same settlements
 are queryable in Postgres and visible in Grafana at
 `localhost:3001/d/sluice-payments` (revenue, paid requests, settle latency).
 
-Every credential in `docker-compose.yml` (private keys, MinIO, Postgres,
-Grafana) is a local demo value for the fork, and none of them are suitable
+To meter the real Firn instead of the built-in stand-in, clone it next to
+this repo and add the override:
+
+```sh
+git clone https://github.com/gordonmurray/firnflow   # next to sluice/
+docker compose -f docker-compose.yml -f docker-compose.firn.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.firn.yml run --rm client
+```
+
+Every credential in the compose files (private keys, Postgres, Grafana, and
+MinIO in the Firn override) is a local demo value for the fork, and none of them are suitable
 for a deployment.
 
 ## Repo layout
