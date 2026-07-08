@@ -24,9 +24,15 @@ use x402_types::proto::SettleResponse;
 /// Largest request body the proxy will buffer before forwarding.
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
-/// Header carrying the caller id for per-caller pricing. Unauthenticated in
-/// rung 1 — treat it as a pricing hint, not an identity claim.
+/// Legacy inbound caller claim. It no longer influences pricing — identity
+/// comes from the API key — but it is still stripped before forwarding so
+/// nothing reaching the origin looks like gateway-vouched tenant identity.
 const CALLER_HEADER: &str = "x-sluice-caller";
+
+/// Header presenting a caller's API key. The key maps to a caller id via
+/// the table at CALLERS_PATH; per-caller prices apply only to callers
+/// authenticated this way. Stripped before forwarding to the origin.
+const API_KEY_HEADER: &str = "x-sluice-api-key";
 
 /// Internal header carrying the per-request pricing decision from the
 /// stamping middleware into the x402 price callback (which sees headers but
@@ -44,10 +50,18 @@ struct AppState {
     strip_prefix: Option<String>,
     http: reqwest::Client,
     rules: SharedRules,
+    /// API key -> caller id. Loaded once at startup (unlike the rules
+    /// table, key changes are rare enough that a restart is acceptable).
+    caller_keys: std::collections::HashMap<String, String>,
     pay_to: String,
     indexer_url: Option<String>,
     indexer_token: Option<String>,
 }
+
+/// The caller resolved from the API key, stamped on the request by
+/// `stamp_decision` so pricing and receipts agree on identity.
+#[derive(Clone)]
+struct ResolvedCaller(Option<String>);
 
 /// A poisoned lock means a panic while *holding* it; the writer never panics
 /// mid-swap (the swap is a pointer store), so recover the value either way.
@@ -66,6 +80,18 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("PAY_TO is not a valid EVM address")?;
     let rules_path = env::var("RULES_PATH").context("RULES_PATH is required")?;
+    // Optional: without a key table no caller authenticates and every
+    // request is priced at the base rate.
+    let caller_keys = match env::var("CALLERS_PATH").ok().filter(|s| !s.is_empty()) {
+        Some(path) => {
+            let json = std::fs::read_to_string(&path)
+                .with_context(|| format!("cannot read caller keys at {path}"))?;
+            let keys = parse_caller_keys(&json)?;
+            tracing::info!(count = keys.len(), %path, "caller API keys loaded");
+            keys
+        }
+        None => Default::default(),
+    };
     let strip_prefix = env::var("STRIP_PREFIX").ok().filter(|s| !s.is_empty());
     let indexer_url = env::var("INDEXER_URL").ok().filter(|s| !s.is_empty());
     // The indexer requires its shared token; refusing to start beats every
@@ -134,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
         strip_prefix,
         http: build_http_client(origin_timeout),
         rules,
+        caller_keys,
         pay_to: format!("{pay_to}"),
         indexer_url,
         indexer_token,
@@ -217,7 +244,10 @@ async fn stamp_decision(
 ) -> Response {
     // Never trust an inbound stamp.
     req.headers_mut().remove(DECISION_HEADER);
-    let caller = caller_id(req.headers());
+    // Identity comes from the API key alone; a bare x-sluice-caller claim
+    // is not consulted, so claiming a caller without credentials prices at
+    // the base rate.
+    let caller = resolve_caller(req.headers(), &st.caller_keys);
     let decision = if path_is_suspicious(req.uri().path()) {
         Decision::Deny
     } else {
@@ -226,6 +256,7 @@ async fn stamp_decision(
     req.headers_mut()
         .insert(DECISION_HEADER, encode_decision(decision));
     req.extensions_mut().insert(decision);
+    req.extensions_mut().insert(ResolvedCaller(caller));
     next.run(req).await
 }
 
@@ -257,7 +288,14 @@ async fn proxy(State(st): State<Arc<AppState>>, req: Request) -> Response {
     if path_is_suspicious(req.uri().path()) {
         return (StatusCode::BAD_REQUEST, "malformed path").into_response();
     }
-    let caller = caller_id(req.headers());
+    // The caller resolved by stamp_decision — receipts must record the
+    // identity the request was priced under, not a second resolution.
+    let caller = req
+        .extensions()
+        .get::<ResolvedCaller>()
+        .cloned()
+        .unwrap_or(ResolvedCaller(None))
+        .0;
     // The decision stamped before the x402 layer — the same one the request
     // was priced under. Fail closed if it is somehow absent.
     let decision = req
@@ -344,10 +382,13 @@ async fn forward(st: &AppState, req: Request) -> anyhow::Result<Response> {
     let conn_named = connection_named(&parts.headers);
     let mut rb = st.http.request(method, &url);
     for (name, value) in &parts.headers {
-        // The caller header is an unauthenticated gateway-side pricing hint,
-        // and the decision stamp is gateway-internal; neither may reach the
-        // origin.
-        if name.as_str() == CALLER_HEADER || name.as_str() == DECISION_HEADER {
+        // Gateway-side identity and pricing headers must not reach the
+        // origin: the API key is a credential, the caller claim would look
+        // like vouched tenant identity, and the decision stamp is internal.
+        if name.as_str() == CALLER_HEADER
+            || name.as_str() == API_KEY_HEADER
+            || name.as_str() == DECISION_HEADER
+        {
             continue;
         }
         if !skip_header(name.as_str()) && !conn_named.contains(name.as_str()) {
@@ -403,18 +444,92 @@ impl RulesReloader {
     }
 }
 
-/// The caller id used for pricing, or None. Deterministic on adversarial
-/// input: duplicated, empty, or non-UTF-8 caller headers all collapse to
-/// "no caller" (base price) — the same answer the pricing layer and the
-/// proxy handler will both compute.
-fn caller_id(headers: &axum::http::HeaderMap) -> Option<String> {
-    let mut values = headers.get_all(CALLER_HEADER).iter();
+/// The caller id for pricing: the API key presented in `x-sluice-api-key`,
+/// looked up in the key table. Anything that does not resolve — no key, an
+/// unknown key, a duplicated/empty/non-UTF-8 header — collapses to "no
+/// caller", which prices at the base rate. Unknown keys are not rejected:
+/// failing open to the base price means a rotated-out key degrades a
+/// customer's discount, not their access.
+///
+/// The lookup is a plain HashMap hit; keys are expected to be high-entropy
+/// random strings (the table maps them to ids), so hash-timing is not a
+/// usable oracle the way string prefix comparison would be.
+fn resolve_caller(
+    headers: &axum::http::HeaderMap,
+    keys: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let key = single_header_value(headers, API_KEY_HEADER)?;
+    keys.get(key).cloned()
+}
+
+/// A header's value if it appears exactly once and is non-empty UTF-8 with
+/// no surrounding whitespace. Credentials are matched byte-exactly — a
+/// padded variant of a key is not an alternate spelling of it, it is a
+/// different (unknown) key. Duplicates and junk bytes collapse to None.
+fn single_header_value<'h>(headers: &'h axum::http::HeaderMap, name: &str) -> Option<&'h str> {
+    let mut values = headers.get_all(name).iter();
     let first = values.next()?;
     if values.next().is_some() {
         return None; // duplicated header: refuse to pick one
     }
-    let s = first.to_str().ok()?.trim();
-    if s.is_empty() { None } else { Some(s.to_owned()) }
+    let s = first.to_str().ok()?;
+    if s.is_empty() || s.trim() != s {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Parse the CALLERS_PATH table: `{ "keys": { "<api key>": "<caller id>" } }`.
+/// Strict on purpose — this file assigns price tiers. Duplicate keys are an
+/// error (serde's default map handling would silently keep one mapping and
+/// discard the other, reassigning a credential on a bad merge), and keys and
+/// caller ids must be non-empty with no surrounding whitespace (a padded
+/// caller id would silently fail to match its rules entry).
+fn parse_caller_keys(
+    json: &str,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    struct KeyMap(std::collections::HashMap<String, String>);
+    impl<'de> serde::Deserialize<'de> for KeyMap {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = KeyMap;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a map of API key to caller id")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut m: A,
+                ) -> Result<KeyMap, A::Error> {
+                    let mut out = std::collections::HashMap::new();
+                    while let Some((k, v)) = m.next_entry::<String, String>()? {
+                        if out.insert(k.clone(), v).is_some() {
+                            return Err(serde::de::Error::custom(format!(
+                                "duplicate API key {k:?}"
+                            )));
+                        }
+                    }
+                    Ok(KeyMap(out))
+                }
+            }
+            d.deserialize_map(V)
+        }
+    }
+    #[derive(serde::Deserialize)]
+    struct CallersFile {
+        keys: KeyMap,
+    }
+    let parsed: CallersFile =
+        serde_json::from_str(json).context("caller keys file is not valid JSON")?;
+    for (key, caller) in &parsed.keys.0 {
+        anyhow::ensure!(
+            !key.is_empty() && key.trim() == key && !caller.is_empty() && caller.trim() == caller,
+            "API keys and caller ids must be non-empty with no surrounding whitespace \
+             (offending entry: {key:?} -> {caller:?})"
+        );
+    }
+    Ok(parsed.keys.0)
 }
 
 /// Fire-and-forget a settlement receipt to the indexer. Failures are logged,
@@ -730,6 +845,7 @@ mod tests {
             rules: Arc::new(RwLock::new(Arc::new(
                 RuleSet::from_json(ITEST_TABLE).unwrap(),
             ))),
+            caller_keys: test_keys(),
             pay_to: "0xpayto".into(),
             indexer_url: None,
             indexer_token: None,
@@ -850,7 +966,23 @@ mod tests {
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         assert_eq!(advertised_amount(&headers), "50000");
 
-        // Per-caller price: 0.002 USDC = 2000 micro.
+        // Per-caller price via a valid API key: 0.002 USDC = 2000 micro.
+        let (status, headers, _) = send(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/paid/q")
+                .header(API_KEY_HEADER, "itest-key-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(advertised_amount(&headers), "2000");
+
+        // The issue's acceptance test: claiming a caller id without valid
+        // credentials is priced at the base rate. A bare caller header —
+        // even naming a discounted tenant — buys nothing.
         let (status, headers, _) = send(
             app.clone(),
             axum::http::Request::builder()
@@ -862,21 +994,37 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
-        assert_eq!(advertised_amount(&headers), "2000");
+        assert_eq!(advertised_amount(&headers), "50000");
 
-        // Unknown callers pay the base price.
+        // An unknown key also falls back to the base rate (fail open to
+        // full price, never to a discount).
         let (status, headers, _) = send(
             app.clone(),
             axum::http::Request::builder()
                 .method("POST")
                 .uri("/paid/q")
-                .header(CALLER_HEADER, "tenant-nobody")
+                .header(API_KEY_HEADER, "not-a-real-key")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         assert_eq!(advertised_amount(&headers), "50000");
+
+        // A valid key wins over a contradictory caller claim.
+        let (status, headers, _) = send(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/paid/q")
+                .header(API_KEY_HEADER, "itest-key-a")
+                .header(CALLER_HEADER, "tenant-nobody")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(advertised_amount(&headers), "2000");
 
         assert!(
             log.lock().unwrap().is_empty(),
@@ -912,6 +1060,7 @@ mod tests {
                 .header("proxy-authorization", "Basic c2Vrcml0")
                 .header("te", "trailers")
                 .header(CALLER_HEADER, "tenant-a")
+                .header(API_KEY_HEADER, "itest-key-a")
                 .header("x-req-keep", "kept")
                 .body(Body::empty())
                 .unwrap(),
@@ -930,7 +1079,8 @@ mod tests {
             "x-req-hop", // nominated by Connection
             "proxy-authorization",
             "te",
-            CALLER_HEADER,   // gateway-internal pricing hint
+            CALLER_HEADER,   // legacy caller claim, never forwarded
+            API_KEY_HEADER,  // a credential; must never reach the origin
             DECISION_HEADER, // gateway-internal decision stamp
         ] {
             assert!(
@@ -989,6 +1139,7 @@ mod tests {
             strip_prefix: None,
             http: build_http_client(1),
             rules: Arc::new(RwLock::new(Arc::new(RuleSet::from_json(table).unwrap()))),
+            caller_keys: test_keys(),
             pay_to: "0xpayto".into(),
             indexer_url: Some(format!("http://{indexer_addr}")),
             indexer_token: Some("sekrit".into()),
@@ -1013,6 +1164,8 @@ mod tests {
             .unwrap();
         req.extensions_mut()
             .insert(Decision::Paid { micro_usdc: 10_000 });
+        req.extensions_mut()
+            .insert(ResolvedCaller(Some("tenant-a".into())));
         req.extensions_mut().insert(Some(settlement));
         req
     }
@@ -1047,6 +1200,9 @@ mod tests {
         assert_eq!(receipt["tx_hash"], "0xabc");
         assert_eq!(receipt["payer"], "0xpayer");
         assert_eq!(receipt["success"], true);
+        // Receipts record the identity the request was priced under — the
+        // ResolvedCaller stamped by the middleware, not a re-resolution.
+        assert_eq!(receipt["caller"], "tenant-a");
     }
 
     /// An origin that accepts the connection and then stalls: the read
@@ -1137,6 +1293,7 @@ mod tests {
             strip_prefix: None,
             http: reqwest::Client::new(),
             rules,
+            caller_keys: test_keys(),
             pay_to: "0x0".into(),
             indexer_url: None,
             indexer_token: None,
@@ -1180,28 +1337,72 @@ mod tests {
         assert!(s.contains(r#"hdr=Some("deny")"#), "{s}");
     }
 
-    #[test]
-    fn caller_id_single_value() {
-        let mut h = HeaderMap::new();
-        h.insert(CALLER_HEADER, HeaderValue::from_static("tenant-a"));
-        assert_eq!(caller_id(&h).as_deref(), Some("tenant-a"));
+    fn test_keys() -> std::collections::HashMap<String, String> {
+        [("itest-key-a".to_string(), "tenant-a".to_string())]
+            .into_iter()
+            .collect()
     }
 
     #[test]
-    fn caller_id_rejects_duplicates_empties_and_junk() {
+    fn known_api_key_resolves_its_caller() {
         let mut h = HeaderMap::new();
-        h.append(CALLER_HEADER, HeaderValue::from_static("tenant-a"));
-        h.append(CALLER_HEADER, HeaderValue::from_static("tenant-b"));
-        assert_eq!(caller_id(&h), None);
+        h.insert(API_KEY_HEADER, HeaderValue::from_static("itest-key-a"));
+        assert_eq!(
+            resolve_caller(&h, &test_keys()).as_deref(),
+            Some("tenant-a")
+        );
+    }
 
+    #[test]
+    fn everything_else_resolves_to_no_caller() {
+        // Unknown key.
         let mut h = HeaderMap::new();
-        h.insert(CALLER_HEADER, HeaderValue::from_static(""));
-        assert_eq!(caller_id(&h), None);
+        h.insert(API_KEY_HEADER, HeaderValue::from_static("who-dis"));
+        assert_eq!(resolve_caller(&h, &test_keys()), None);
 
+        // A bare caller claim with no key is not identity.
         let mut h = HeaderMap::new();
-        h.insert(CALLER_HEADER, HeaderValue::from_bytes(b"\xff\xfe").unwrap());
-        assert_eq!(caller_id(&h), None);
+        h.insert(CALLER_HEADER, HeaderValue::from_static("tenant-a"));
+        assert_eq!(resolve_caller(&h, &test_keys()), None);
 
-        assert_eq!(caller_id(&HeaderMap::new()), None);
+        // Duplicated key header: refuse to pick one.
+        let mut h = HeaderMap::new();
+        h.append(API_KEY_HEADER, HeaderValue::from_static("itest-key-a"));
+        h.append(API_KEY_HEADER, HeaderValue::from_static("other"));
+        assert_eq!(resolve_caller(&h, &test_keys()), None);
+
+        // Empty and non-UTF-8 values.
+        let mut h = HeaderMap::new();
+        h.insert(API_KEY_HEADER, HeaderValue::from_static(""));
+        assert_eq!(resolve_caller(&h, &test_keys()), None);
+        let mut h = HeaderMap::new();
+        h.insert(API_KEY_HEADER, HeaderValue::from_bytes(b"\xff\xfe").unwrap());
+        assert_eq!(resolve_caller(&h, &test_keys()), None);
+
+        // Credentials match byte-exactly: a padded key is an unknown key.
+        let mut h = HeaderMap::new();
+        h.insert(API_KEY_HEADER, HeaderValue::from_static(" itest-key-a "));
+        assert_eq!(resolve_caller(&h, &test_keys()), None);
+
+        assert_eq!(resolve_caller(&HeaderMap::new(), &test_keys()), None);
+    }
+
+    #[test]
+    fn caller_keys_file_parses_and_validates() {
+        let keys =
+            parse_caller_keys(r#"{ "keys": { "k1": "tenant-a", "k2": "tenant-b" } }"#).unwrap();
+        assert_eq!(keys.get("k1").map(String::as_str), Some("tenant-a"));
+        assert_eq!(keys.len(), 2);
+
+        assert!(parse_caller_keys("not json").is_err());
+        assert!(parse_caller_keys(r#"{ "keys": { "": "tenant-a" } }"#).is_err());
+        assert!(parse_caller_keys(r#"{ "keys": { "k": " " } }"#).is_err());
+        // Whitespace-padded entries would silently mismatch at runtime.
+        assert!(parse_caller_keys(r#"{ "keys": { "k ": "tenant-a" } }"#).is_err());
+        assert!(parse_caller_keys(r#"{ "keys": { "k": "tenant-a " } }"#).is_err());
+        // A duplicated key must fail loudly, not silently pick one mapping.
+        assert!(
+            parse_caller_keys(r#"{ "keys": { "k": "tenant-a", "k": "tenant-b" } }"#).is_err()
+        );
     }
 }

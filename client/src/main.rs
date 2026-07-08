@@ -75,16 +75,45 @@ async fn main() -> anyhow::Result<()> {
         "paid search returned no results"
     );
 
-    // 4. Same search as tenant-a, which the rules table prices lower.
-    let res = paying
+    // 4. Caller identity is the API key, not a header claim: a bare
+    //    x-sluice-caller naming the discounted tenant is quoted the base
+    //    price, while the key gets the per-caller price.
+    let api_key = env::var("CLIENT_API_KEY").context("CLIENT_API_KEY is required")?;
+    let res = plain
         .post(&query_url)
         .header("x-sluice-caller", "tenant-a")
+        .json(&search)
+        .send()
+        .await?;
+    let claimed = advertised_amount(&res).context("no 402 amount for the spoofed claim")?;
+    println!("POST /firn/ns/demo/query (claimed tenant-a, no key) -> quoted {claimed}");
+    anyhow::ensure!(
+        claimed == "50000",
+        "a bare caller claim must be quoted the base price, got {claimed}"
+    );
+    let res = plain
+        .post(&query_url)
+        .header("x-sluice-api-key", &api_key)
+        .json(&search)
+        .send()
+        .await?;
+    let keyed = advertised_amount(&res).context("no 402 amount for the API key")?;
+    println!("POST /firn/ns/demo/query (api key for tenant-a)   -> quoted {keyed}");
+    anyhow::ensure!(
+        keyed == "20000",
+        "the tenant-a key should be quoted the per-caller price, got {keyed}"
+    );
+
+    // ...and the keyed request paid at that price goes through.
+    let res = paying
+        .post(&query_url)
+        .header("x-sluice-api-key", &api_key)
         .header("content-type", "application/json")
         .body(serde_json::to_vec(&search)?)
         .send()
         .await?;
     let status = res.status();
-    println!("POST /firn/ns/demo/query (x402, caller tenant-a) -> {status}");
+    println!("POST /firn/ns/demo/query (x402, api key tenant-a) -> {status}");
     println!(
         "  payment-response (base64): {}",
         header(&res, "payment-response").as_deref().unwrap_or("<missing>")
@@ -139,4 +168,17 @@ fn header(res: &reqwest::Response, name: &str) -> Option<String> {
     res.headers()
         .get(name)
         .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+}
+
+/// The micro-USDC amount a 402's payment-required header quotes.
+fn advertised_amount(res: &reqwest::Response) -> Option<String> {
+    use base64::Engine;
+    if res.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
+        return None;
+    }
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(header(res, "payment-required")?)
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    Some(v["accepts"][0]["amount"].as_str()?.to_string())
 }
