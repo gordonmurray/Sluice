@@ -1,2 +1,6 @@
 /target
 .env
+
+# local-only notes
+CLAUDE.md
+/docs/
