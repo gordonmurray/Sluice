@@ -75,6 +75,12 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("INDEXER_TOKEN is required when INDEXER_URL is set");
     }
     let bind = env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let origin_timeout: u64 = env::var("ORIGIN_TIMEOUT_SECS")
+        .ok()
+        .map(|s| s.parse())
+        .transpose()
+        .context("ORIGIN_TIMEOUT_SECS must be a whole number of seconds")?
+        .unwrap_or(30);
 
     let rules_json = std::fs::read_to_string(&rules_path)
         .with_context(|| format!("cannot read rules table at {rules_path}"))?;
@@ -155,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         origin: origin.trim_end_matches('/').to_string(),
         strip_prefix,
-        http: reqwest::Client::new(),
+        http: build_http_client(origin_timeout),
         rules,
         pay_to: format!("{pay_to}"),
         indexer_url,
@@ -253,23 +259,53 @@ async fn proxy(State(st): State<Arc<AppState>>, req: Request) -> Response {
     }
 
     // The x402 layer stores the settlement result as a request extension.
-    // Report it to the indexer without holding up the proxied response.
-    if let Some(settlement) = req
+    // It is reported to the indexer only after the origin outcome is known,
+    // so the receipt records what the payment actually bought — that is the
+    // paid-but-failed policy (see migrations/0002): no automatic retry or
+    // refund, but every settlement lands in the payments table with the
+    // status the client got, and refunds are an operator decision from
+    // there. The cost of reporting late: a gateway crash mid-request loses
+    // the receipt (fire-and-forget could always drop one; the chain remains
+    // the source of truth).
+    let settlement = req
         .extensions()
         .get::<Option<SettleResponse>>()
         .cloned()
-        .flatten()
-    {
-        report_settlement(&st, settlement, req.uri().path(), caller.as_deref(), decision);
-    }
+        .flatten();
+    let path = req.uri().path().to_owned();
 
-    match forward(&st, req).await {
+    let resp = match forward(&st, req).await {
         Ok(resp) => resp,
         Err(err) => {
             tracing::error!(error = %err, "proxy error");
             (StatusCode::BAD_GATEWAY, "upstream error").into_response()
         }
+    };
+    if let Some(settlement) = settlement {
+        report_settlement(
+            &st,
+            settlement,
+            &path,
+            caller.as_deref(),
+            decision,
+            resp.status().as_u16(),
+        );
     }
+    resp
+}
+
+/// Bounded patience with the origin. Without a timeout, an origin that
+/// accepts the connection and then stalls leaves a *settled* request hanging
+/// forever — never answered, never reported to the indexer. With it, a stall
+/// becomes a 502 the client sees and the receipt records. This is a
+/// connect/inter-read timeout, not a whole-request cap: long streamed
+/// responses are fine as long as bytes keep flowing.
+fn build_http_client(timeout_secs: u64) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(timeout_secs.min(10)))
+        .read_timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .expect("reqwest client construction cannot fail with static options")
 }
 
 async fn forward(st: &AppState, req: Request) -> anyhow::Result<Response> {
@@ -378,6 +414,7 @@ fn report_settlement(
     path: &str,
     caller: Option<&str>,
     decision: Decision,
+    origin_status: u16,
 ) {
     let Some(indexer_url) = st.indexer_url.clone() else {
         return;
@@ -421,6 +458,7 @@ fn report_settlement(
         "path": path,
         "caller": caller,
         "success": success,
+        "origin_status": origin_status,
     });
     let http = st.http.clone();
     tokio::spawn(async move {
@@ -629,6 +667,152 @@ mod tests {
         // Recovery: fixing the file swaps the fix in.
         assert_eq!(r.apply(table("0.05").into_bytes()), Ok(true));
         assert_eq!(price_of(&shared), Decision::Paid { micro_usdc: 50_000 });
+    }
+
+    type ReceiptRx = tokio::sync::mpsc::Receiver<(Option<String>, serde_json::Value)>;
+
+    /// An in-process indexer stand-in that captures receipt POSTs, plus the
+    /// state pointing the proxy at `origin` and at it.
+    async fn state_with_receipt_capture(origin: String) -> (Arc<AppState>, ReceiptRx) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<(Option<String>, serde_json::Value)>(1);
+        let capture = move |headers: axum::http::HeaderMap,
+                            axum::Json(v): axum::Json<serde_json::Value>| {
+            let tx = tx.clone();
+            async move {
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|h| h.to_str().ok())
+                    .map(String::from);
+                let _ = tx.send((auth, v)).await;
+                StatusCode::NO_CONTENT
+            }
+        };
+        let indexer = Router::new().route("/receipts", axum::routing::post(capture));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let indexer_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, indexer).await.unwrap() });
+
+        let table = r#"{ "rules": [ { "prefix": "/p", "price_usdc": "0.01" } ] }"#;
+        let state = Arc::new(AppState {
+            origin,
+            strip_prefix: None,
+            http: build_http_client(1),
+            rules: Arc::new(RwLock::new(Arc::new(RuleSet::from_json(table).unwrap()))),
+            pay_to: "0xpayto".into(),
+            indexer_url: Some(format!("http://{indexer_addr}")),
+            indexer_token: Some("sekrit".into()),
+        });
+        (state, rx)
+    }
+
+    /// A request as it arrives at the proxy for a settled paid route: the
+    /// stamped decision and the x402 layer's settlement in the extensions.
+    fn settled_request(body: Body) -> Request {
+        let settlement: SettleResponse = serde_json::from_value(serde_json::json!({
+            "network": "eip155:8453",
+            "payer": "0xpayer",
+            "success": true,
+            "transaction": "0xabc",
+        }))
+        .expect("SettleResponse wire shape");
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/p")
+            .body(body)
+            .unwrap();
+        req.extensions_mut()
+            .insert(Decision::Paid { micro_usdc: 10_000 });
+        req.extensions_mut().insert(Some(settlement));
+        req
+    }
+
+    async fn next_receipt(rx: &mut ReceiptRx) -> (Option<String>, serde_json::Value) {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("settlement was not reported")
+            .unwrap()
+    }
+
+    /// The paid-but-failed policy's acceptance test: origin down after
+    /// payment. The client gets 502, and the settlement is still reported —
+    /// with origin_status 502 — so the payments table can answer "who paid
+    /// and got nothing" for the operator-driven refund flow.
+    #[tokio::test]
+    async fn paid_request_with_origin_down_returns_502_and_reports_it() {
+        // An origin that refuses connections: bind a port, then drop it.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+
+        let (state, mut rx) = state_with_receipt_capture(format!("http://{dead_addr}")).await;
+        let resp = proxy(State(state), settled_request(Body::empty())).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let (auth, receipt) = next_receipt(&mut rx).await;
+        assert_eq!(auth.as_deref(), Some("Bearer sekrit"));
+        assert_eq!(receipt["origin_status"], 502);
+        assert_eq!(receipt["path"], "/p");
+        assert_eq!(receipt["amount_micro_usdc"], 10_000);
+        assert_eq!(receipt["tx_hash"], "0xabc");
+        assert_eq!(receipt["payer"], "0xpayer");
+        assert_eq!(receipt["success"], true);
+    }
+
+    /// An origin that accepts the connection and then stalls: the read
+    /// timeout turns it into a 502 that is answered and reported, instead of
+    /// a settled request hanging unreported forever.
+    #[tokio::test]
+    async fn paid_request_with_stalled_origin_times_out_and_reports_502() {
+        let stall = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stall_addr = stall.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((sock, _)) = stall.accept().await {
+                    held.push(sock); // accept, never respond
+                }
+            }
+        });
+
+        // The helper builds the client with a 1s read timeout.
+        let (state, mut rx) = state_with_receipt_capture(format!("http://{stall_addr}")).await;
+        let resp = proxy(State(state), settled_request(Body::empty())).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let (_, receipt) = next_receipt(&mut rx).await;
+        assert_eq!(receipt["origin_status"], 502);
+    }
+
+    /// The origin's own status is recorded verbatim, 5xx or not.
+    #[tokio::test]
+    async fn origin_status_is_recorded_verbatim() {
+        let origin = Router::new().fallback(|| async { (StatusCode::NOT_FOUND, "nope") });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+
+        let (state, mut rx) = state_with_receipt_capture(format!("http://{origin_addr}")).await;
+        let resp = proxy(State(state), settled_request(Body::empty())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let (_, receipt) = next_receipt(&mut rx).await;
+        assert_eq!(receipt["origin_status"], 404);
+    }
+
+    /// A settled request whose body the gateway itself refuses: the 413 is
+    /// what the payment bought, and the receipt says so.
+    #[tokio::test]
+    async fn paid_request_with_oversized_body_reports_413() {
+        // Origin must not be reached; a refusing port proves it wasn't
+        // (reaching it would yield 502, not 413).
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+
+        let (state, mut rx) = state_with_receipt_capture(format!("http://{dead_addr}")).await;
+        let big = Body::from(vec![0u8; MAX_BODY_BYTES + 1]);
+        let resp = proxy(State(state), settled_request(big)).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let (_, receipt) = next_receipt(&mut rx).await;
+        assert_eq!(receipt["origin_status"], 413);
     }
 
     #[test]

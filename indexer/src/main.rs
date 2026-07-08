@@ -35,6 +35,9 @@ struct Receipt {
     path: String,
     caller: Option<String>,
     success: bool,
+    /// What the client got back for the request this payment bought; None
+    /// only if the gateway could not determine it.
+    origin_status: Option<i16>,
 }
 
 #[tokio::main]
@@ -102,8 +105,9 @@ async fn ingest(
 ) -> impl IntoResponse {
     let res = sqlx::query(
         "INSERT INTO payments
-             (tx_hash, network, payer, pay_to, amount_micro_usdc, path, caller, success)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             (tx_hash, network, payer, pay_to, amount_micro_usdc, path, caller, success,
+              origin_status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (network, tx_hash) DO NOTHING",
     )
     .bind(&r.tx_hash)
@@ -114,6 +118,7 @@ async fn ingest(
     .bind(&r.path)
     .bind(&r.caller)
     .bind(r.success)
+    .bind(r.origin_status)
     .execute(&app.pool)
     .await;
 
