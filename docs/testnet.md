@@ -47,8 +47,11 @@ exist).
 
 ## Local shortcuts to revisit before real money
 
-- `x-sluice-caller` is an unauthenticated pricing hint; per-caller discounts
-  need real identity first.
+- Per-caller pricing requires the caller's API key (`config/callers.json`,
+  sent as `x-sluice-api-key`); a bare `x-sluice-caller` claim prices at the
+  base rate. The compose key is a dev value — issue real high-entropy keys
+  off-machine, and note the key table loads at startup (key changes need a
+  gateway restart).
 - The indexer's `/receipts` endpoint requires the `INDEXER_TOKEN` shared
   secret (compose ships a dev-only value; use a real secret off-machine).
 - Settle-before-execution means a client can pay for a request the origin

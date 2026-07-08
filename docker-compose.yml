@@ -200,6 +200,8 @@ services:
       FACILITATOR_URL: http://facilitator:8080
       PAY_TO: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
       RULES_PATH: /app/config/rules.json
+      # API key -> caller id map; dev-only keys, real ones stay off-machine.
+      CALLERS_PATH: /app/config/callers.json
       STRIP_PREFIX: /firn
       INDEXER_URL: http://indexer:8090
       INDEXER_TOKEN: sluice-dev-indexer-token
@@ -222,6 +224,7 @@ services:
     environment:
       GATEWAY_URL: http://gateway:8080
       CLIENT_PRIVATE_KEY: "0x69935b0e457ed4de0c989163f1c1aa7cf899de6cff42b1829a42f4fa6a607da3"
+      CLIENT_API_KEY: sluice-dev-key-tenant-a
 
 volumes:
   minio-data:

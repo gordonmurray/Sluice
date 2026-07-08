@@ -26,7 +26,9 @@ client ──► gateway (axum + x402-axum) ──► origin (any HTTP service)
 
 The demo meters [Firn](https://github.com/gordonmurray/firnflow), a
 multi-tenant vector and full-text search engine, at $0.05 a query ($0.02 for
-one configured caller). The origin is pluggable; any request/response HTTP
+one configured caller, authenticated by API key — `config/callers.json` maps
+keys to caller ids, presented as `x-sluice-api-key`; unauthenticated caller
+claims are priced at the base rate). The origin is pluggable; any request/response HTTP
 service can be metered the same way (request bodies are capped at 10 MiB,
 and WebSockets and streaming uploads are not supported yet). Pricing is a
 table edit, not a code change.
