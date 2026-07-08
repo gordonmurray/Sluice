@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true }
+subtle = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = [
@@ -20,3 +21,6 @@ sqlx = { version = "0.8", default-features = false, features = [
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

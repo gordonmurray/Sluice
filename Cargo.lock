@@ -2478,7 +2478,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "subtle",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

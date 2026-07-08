@@ -49,8 +49,8 @@ exist).
 
 - `x-sluice-caller` is an unauthenticated pricing hint; per-caller discounts
   need real identity first.
-- The indexer's `/receipts` endpoint trusts the internal network; add a
-  shared secret.
+- The indexer's `/receipts` endpoint requires the `INDEXER_TOKEN` shared
+  secret (compose ships a dev-only value; use a real secret off-machine).
 - Settle-before-execution means a client can pay for a request the origin
   then fails; decide the refund/retry policy.
 - Grafana and Postgres credentials are compose-local defaults.

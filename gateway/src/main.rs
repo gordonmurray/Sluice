@@ -30,6 +30,7 @@ struct AppState {
     rules: Arc<RuleSet>,
     pay_to: String,
     indexer_url: Option<String>,
+    indexer_token: Option<String>,
 }
 
 #[tokio::main]
@@ -45,6 +46,12 @@ async fn main() -> anyhow::Result<()> {
     let rules_path = env::var("RULES_PATH").context("RULES_PATH is required")?;
     let strip_prefix = env::var("STRIP_PREFIX").ok().filter(|s| !s.is_empty());
     let indexer_url = env::var("INDEXER_URL").ok().filter(|s| !s.is_empty());
+    // The indexer requires its shared token; refusing to start beats every
+    // receipt silently bouncing off a 401.
+    let indexer_token = env::var("INDEXER_TOKEN").ok().filter(|s| !s.is_empty());
+    if indexer_url.is_some() && indexer_token.is_none() {
+        anyhow::bail!("INDEXER_TOKEN is required when INDEXER_URL is set");
+    }
     let bind = env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
     let rules_json = std::fs::read_to_string(&rules_path)
@@ -91,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
         rules,
         pay_to: format!("{pay_to}"),
         indexer_url,
+        indexer_token,
     });
 
     let app = Router::new()
@@ -222,6 +230,10 @@ fn report_settlement(
     let Some(indexer_url) = st.indexer_url.clone() else {
         return;
     };
+    // Present whenever indexer_url is (enforced at startup).
+    let Some(indexer_token) = st.indexer_token.clone() else {
+        return;
+    };
     let amount = match decision {
         Decision::Paid { micro_usdc } => micro_usdc as i64,
         _ => return, // settlement without a paid decision cannot happen
@@ -262,6 +274,7 @@ fn report_settlement(
     tokio::spawn(async move {
         let res = http
             .post(format!("{indexer_url}/receipts"))
+            .bearer_auth(indexer_token)
             .json(&receipt)
             .send()
             .await;
