@@ -9,6 +9,7 @@ publish.workspace = true
 anyhow = { workspace = true }
 axum = { workspace = true }
 rules = { path = "../rules" }
+prometheus = "0.13"
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

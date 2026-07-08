@@ -69,6 +69,75 @@ fn current_rules(shared: &SharedRules) -> Arc<RuleSet> {
     shared.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Request metrics, recorded once per proxied request in `stamp_decision`
+/// (which wraps the x402 layer and the proxy, so 402 quotes, denials, and
+/// proxied responses are all one observation each). Label cardinality is
+/// bounded: three decisions, and HTTP statuses the gateway actually emits.
+struct GatewayMetrics {
+    registry: prometheus::Registry,
+    requests: prometheus::IntCounterVec,
+    duration: prometheus::HistogramVec,
+}
+
+fn metrics() -> &'static GatewayMetrics {
+    use std::sync::OnceLock;
+    static METRICS: OnceLock<GatewayMetrics> = OnceLock::new();
+    METRICS.get_or_init(|| {
+        let registry = prometheus::Registry::new();
+        let requests = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "sluice_gateway_requests_total",
+                "Requests through the gateway by pricing decision and response status",
+            ),
+            &["decision", "status"],
+        )
+        .expect("static metric definition");
+        let duration = prometheus::HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "sluice_gateway_request_duration_seconds",
+                "Wall-clock request duration through the gateway by pricing decision",
+            ),
+            &["decision"],
+        )
+        .expect("static metric definition");
+        registry
+            .register(Box::new(requests.clone()))
+            .expect("first registration");
+        registry
+            .register(Box::new(duration.clone()))
+            .expect("first registration");
+        GatewayMetrics {
+            registry,
+            requests,
+            duration,
+        }
+    })
+}
+
+fn decision_label(d: Decision) -> &'static str {
+    match d {
+        Decision::Free => "free",
+        Decision::Paid { .. } => "paid",
+        Decision::Deny => "deny",
+    }
+}
+
+async fn serve_metrics() -> Response {
+    use prometheus::Encoder;
+    let mut buf = Vec::new();
+    let encoder = prometheus::TextEncoder::new();
+    if let Err(e) = encoder.encode(&metrics().registry.gather(), &mut buf) {
+        tracing::error!(error = %e, "cannot encode metrics");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "encode error").into_response();
+    }
+    (
+        StatusCode::OK,
+        [("content-type", encoder.format_type().to_string())],
+        buf,
+    )
+        .into_response()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -213,8 +282,14 @@ fn build_app(
 
     // Layer order (outermost first): stamp_decision, x402, proxy — the
     // stamp must exist before the x402 layer prices the request.
+    // Reserved gateway paths: /healthz and /metrics belong to the gateway
+    // itself and are never proxied, whatever the rules table says (explicit
+    // routes win over the fallback proxy). An origin's own endpoints at
+    // those names stay reachable under its configured prefix, e.g.
+    // /firn/metrics -> origin /metrics.
     Ok(Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(serve_metrics))
         .fallback_service(
             any(proxy)
                 .layer(x402.with_dynamic_price(pricer))
@@ -257,7 +332,22 @@ async fn stamp_decision(
         .insert(DECISION_HEADER, encode_decision(decision));
     req.extensions_mut().insert(decision);
     req.extensions_mut().insert(ResolvedCaller(caller));
-    next.run(req).await
+
+    // One observation per request, wrapping the x402 layer and the proxy:
+    // a 402 quote, a denial, and a proxied response each count once, with
+    // the status the client actually received.
+    let start = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let label = decision_label(decision);
+    metrics()
+        .duration
+        .with_label_values(&[label])
+        .observe(start.elapsed().as_secs_f64());
+    metrics()
+        .requests
+        .with_label_values(&[label, resp.status().as_str()])
+        .inc();
+    resp
 }
 
 fn encode_decision(d: Decision) -> HeaderValue {
@@ -1030,6 +1120,115 @@ mod tests {
             log.lock().unwrap().is_empty(),
             "unpaid requests to paid routes must not touch the origin"
         );
+    }
+
+    #[tokio::test]
+    async fn requests_are_counted_by_decision_on_the_metrics_endpoint() {
+        let (app, _log) = full_app().await;
+        for (uri, hdr) in [
+            ("/free/x", None),
+            ("/paid/x", None),
+            ("/other", None),
+            ("/paid/x", Some((API_KEY_HEADER, "itest-key-a"))),
+        ] {
+            let mut req = axum::http::Request::builder().method("POST").uri(uri);
+            if let Some((k, v)) = hdr {
+                req = req.header(k, v);
+            }
+            send(app.clone(), req.body(Body::empty()).unwrap()).await;
+        }
+
+        let (status, headers, body) = send(
+            app,
+            axum::http::Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("text/plain")),
+        );
+        // The metrics registry is process-wide and tests run in parallel,
+        // so assert the series exist rather than exact counts.
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        for series in [
+            r#"sluice_gateway_requests_total{decision="free",status="200"}"#,
+            r#"sluice_gateway_requests_total{decision="paid",status="402"}"#,
+            r#"sluice_gateway_requests_total{decision="deny",status="404"}"#,
+            r#"sluice_gateway_request_duration_seconds_bucket{decision="paid""#,
+        ] {
+            assert!(text.contains(series), "missing series {series}\n{text}");
+        }
+    }
+
+    /// One request = exactly one observation, and scraping /metrics is not
+    /// gateway traffic. Uses an origin that 404s plus a free rule so the
+    /// (free, 404) label pair is unique to this test — the registry is
+    /// process-wide and other tests increment other pairs concurrently.
+    #[tokio::test]
+    async fn one_request_is_one_observation_and_scrapes_are_not_counted() {
+        let origin = Router::new().fallback(|| async { (StatusCode::NOT_FOUND, "nope") });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+
+        let table = r#"{ "rules": [ { "prefix": "/free", "pricing": "free" },
+                                    { "prefix": "/metrics", "price_usdc": "9" } ] }"#;
+        let state = Arc::new(AppState {
+            origin: format!("http://{origin_addr}"),
+            strip_prefix: None,
+            http: build_http_client(5),
+            rules: Arc::new(RwLock::new(Arc::new(RuleSet::from_json(table).unwrap()))),
+            caller_keys: test_keys(),
+            pay_to: "0xpayto".into(),
+            indexer_url: None,
+            indexer_token: None,
+        });
+        let app = build_app(state, "http://127.0.0.1:1", Address::ZERO).unwrap();
+
+        let count = || {
+            metrics()
+                .requests
+                .with_label_values(&["free", "404"])
+                .get()
+        };
+        let before = count();
+        let (status, _, _) = send(
+            app.clone(),
+            axum::http::Request::builder()
+                .uri("/free/x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND); // origin's 404, proxied
+        assert_eq!(count(), before + 1, "exactly one observation per request");
+
+        // /metrics is a reserved gateway path: even priced in the rules
+        // table it serves the exposition (no 402), and scrapes are not
+        // counted as gateway traffic.
+        for _ in 0..2 {
+            let (status, _, body) = send(
+                app.clone(),
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                String::from_utf8(body.to_vec())
+                    .unwrap()
+                    .contains("sluice_gateway_requests_total")
+            );
+        }
+        assert_eq!(count(), before + 1, "scrapes must not count as traffic");
     }
 
     #[tokio::test]

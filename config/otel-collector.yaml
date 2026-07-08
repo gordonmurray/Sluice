@@ -9,6 +9,10 @@ receivers:
 connectors:
   # Derive request-duration histograms from spans, so settle latency comes
   # from the facilitator's traces without any code changes.
+  #
+  # The key must stay `spanmetrics` on this image: despite upstream talk of
+  # a `span_metrics` rename, otel-collector-contrib 0.116.1 rejects it
+  # ("unknown type: span_metrics"; verified 2026-07). Revisit on image bump.
   spanmetrics:
     histogram:
       unit: ms
