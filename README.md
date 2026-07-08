@@ -84,7 +84,11 @@ docker exec sluice-anvil cast call 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 \
 One client run pays for two searches (50000 + 20000 micro-USDC, six
 decimals), so the pay-to balance grows by 70000 per run. The same settlements
 are queryable in Postgres and visible in Grafana at
-`localhost:3001/d/sluice-payments` (revenue, paid requests, settle latency).
+`localhost:3001/d/sluice-payments` (revenue, paid requests, settle latency,
+and gateway request rates/latency by pricing decision — the gateway exposes
+Prometheus metrics at `/metrics`; that path and `/healthz` are the gateway's
+own and are never proxied, though an origin's endpoints stay reachable under
+their prefix, e.g. `/firn/metrics`).
 
 To meter the real Firn instead of the built-in stand-in, clone it next to
 this repo and add the override:
