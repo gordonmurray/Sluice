@@ -97,6 +97,11 @@ for a deployment.
 | `scripts/` | USDC funding on the fork, Firn seeding, dockerised cargo |
 | `docs/` | build notes and [gotchas](docs/gotchas.md) hit along the way |
 
+Prices live in `config/rules.json` and hot-reload: the gateway re-reads the
+file every couple of seconds (`RULES_RELOAD_SECS`, 0 disables) and swaps the
+table in atomically. A malformed edit is logged and ignored; the previous
+table keeps serving until the file parses again.
+
 Built local-first: the offline anvil loop above is the primary dev
 environment. Base Sepolia comes next ([what that needs](docs/testnet.md)),
 then production with real USDC on Base mainnet.

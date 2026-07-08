@@ -22,3 +22,6 @@ x402-chain-eip155 = { workspace = true, features = ["server", "telemetry"] }
 x402-types = { workspace = true }
 
 alloy-primitives = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

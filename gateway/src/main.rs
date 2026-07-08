@@ -1,4 +1,8 @@
-use std::{env, sync::Arc};
+use std::{
+    env,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use alloy_primitives::Address;
 use anyhow::Context;
@@ -6,7 +10,8 @@ use axum::{
     Router,
     body::Body,
     extract::{Request, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{any, get},
 };
@@ -23,14 +28,31 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// rung 1 — treat it as a pricing hint, not an identity claim.
 const CALLER_HEADER: &str = "x-sluice-caller";
 
+/// Internal header carrying the per-request pricing decision from the
+/// stamping middleware into the x402 price callback (which sees headers but
+/// not request extensions). Stamped by the gateway only: inbound copies are
+/// stripped before the decision is computed, and it is never forwarded to
+/// the origin.
+const DECISION_HEADER: &str = "x-sluice-decision";
+
+/// The live rules table. Requests clone the inner `Arc` out (cheap, no lock
+/// held across awaits); the reloader swaps a freshly parsed table in.
+type SharedRules = Arc<RwLock<Arc<RuleSet>>>;
+
 struct AppState {
     origin: String,
     strip_prefix: Option<String>,
     http: reqwest::Client,
-    rules: Arc<RuleSet>,
+    rules: SharedRules,
     pay_to: String,
     indexer_url: Option<String>,
     indexer_token: Option<String>,
+}
+
+/// A poisoned lock means a panic while *holding* it; the writer never panics
+/// mid-swap (the swap is a pointer store), so recover the value either way.
+fn current_rules(shared: &SharedRules) -> Arc<RuleSet> {
+    shared.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 #[tokio::main]
@@ -56,7 +78,50 @@ async fn main() -> anyhow::Result<()> {
 
     let rules_json = std::fs::read_to_string(&rules_path)
         .with_context(|| format!("cannot read rules table at {rules_path}"))?;
-    let rules = Arc::new(RuleSet::from_json(&rules_json)?);
+    let rules: SharedRules = Arc::new(RwLock::new(Arc::new(RuleSet::from_json(&rules_json)?)));
+
+    // Re-read the rules file on a short interval and swap the table in
+    // atomically; a malformed edit is logged and the old table keeps
+    // serving. 0 disables reloading.
+    let reload_secs: u64 = env::var("RULES_RELOAD_SECS")
+        .ok()
+        .map(|s| s.parse())
+        .transpose()
+        .context("RULES_RELOAD_SECS must be a whole number of seconds")?
+        .unwrap_or(2);
+    if reload_secs > 0 {
+        let mut reloader = RulesReloader {
+            shared: rules.clone(),
+            last: rules_json.into_bytes(),
+        };
+        let rules_path = rules_path.clone();
+        tokio::spawn(async move {
+            // Log read failures on the transition only, not every tick.
+            let mut read_failing = false;
+            loop {
+                tokio::time::sleep(Duration::from_secs(reload_secs)).await;
+                match tokio::fs::read(&rules_path).await {
+                    Ok(bytes) => {
+                        read_failing = false;
+                        match reloader.apply(bytes) {
+                            Ok(true) => tracing::info!(%rules_path, "rules table reloaded"),
+                            Ok(false) => {}
+                            Err(e) => tracing::error!(
+                                error = %e, %rules_path,
+                                "invalid rules table; keeping the previous one"
+                            ),
+                        }
+                    }
+                    // Read failures keep the old table too.
+                    Err(e) if !read_failing => {
+                        read_failing = true;
+                        tracing::error!(error = %e, %rules_path, "cannot read rules file");
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+    }
 
     // Settle before forwarding: the origin never does unpaid work, and the
     // settlement lands in the request extensions for the indexer.
@@ -64,29 +129,25 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid FACILITATOR_URL: {e}"))?
         .settle_before_execution();
 
-    // Price tags are derived per-request from the rules table. Free and
+    // Price tags come from the decision stamped by `stamp_decision` — the
+    // rules table is read exactly once per request, so a mid-request reload
+    // cannot price under one table and forward under another. Free and
     // denied requests get no price tag (the x402 layer then forwards them
     // untouched); denial is enforced by the proxy handler behind the layer.
     let usdc = USDC::base();
-    let pricer = {
-        let rules = rules.clone();
-        move |headers: &axum::http::HeaderMap, uri: &axum::http::Uri, _base: Option<&reqwest::Url>| {
-            let caller = caller_id(headers);
-            // Suspicious paths get no price tag so nobody pays for a request
-            // the proxy handler is going to reject.
-            let decision = if path_is_suspicious(uri.path()) {
-                Decision::Deny
-            } else {
-                rules.decide(uri.path(), caller.as_deref())
-            };
-            let usdc = usdc.clone();
-            async move {
-                match decision {
-                    Decision::Paid { micro_usdc } => {
-                        vec![V2Eip155Exact::price_tag(pay_to, usdc.amount(micro_usdc))]
-                    }
-                    Decision::Free | Decision::Deny => vec![],
+    let pricer = move |headers: &axum::http::HeaderMap,
+                       _uri: &axum::http::Uri,
+                       _base: Option<&reqwest::Url>| {
+        // Missing/undecodable stamp cannot happen behind the middleware;
+        // fail closed (no price tag, handler denies) if it somehow does.
+        let decision = decode_decision(headers.get(DECISION_HEADER)).unwrap_or(Decision::Deny);
+        let usdc = usdc.clone();
+        async move {
+            match decision {
+                Decision::Paid { micro_usdc } => {
+                    vec![V2Eip155Exact::price_tag(pay_to, usdc.amount(micro_usdc))]
                 }
+                Decision::Free | Decision::Deny => vec![],
             }
         }
     };
@@ -101,11 +162,17 @@ async fn main() -> anyhow::Result<()> {
         indexer_token,
     });
 
+    // Layer order (outermost first): stamp_decision, x402, proxy — the
+    // stamp must exist before the x402 layer prices the request.
     let app = Router::new()
         .route("/healthz", get(healthz))
         .fallback_service(
             any(proxy)
                 .layer(x402.with_dynamic_price(pricer))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    stamp_decision,
+                ))
                 .with_state(state.clone()),
         )
         .with_state(state);
@@ -120,6 +187,51 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+/// Decide the request's pricing exactly once, before the x402 layer, and
+/// stamp it on the request: as an extension for the proxy handler and as an
+/// internal header for the x402 price callback (which sees headers, not
+/// extensions). One read of the live rules table per request means a
+/// concurrent reload cannot split a request across two tables — priced
+/// under one, forwarded (or denied) under another.
+async fn stamp_decision(
+    State(st): State<Arc<AppState>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    // Never trust an inbound stamp.
+    req.headers_mut().remove(DECISION_HEADER);
+    let caller = caller_id(req.headers());
+    let decision = if path_is_suspicious(req.uri().path()) {
+        Decision::Deny
+    } else {
+        current_rules(&st.rules).decide(req.uri().path(), caller.as_deref())
+    };
+    req.headers_mut()
+        .insert(DECISION_HEADER, encode_decision(decision));
+    req.extensions_mut().insert(decision);
+    next.run(req).await
+}
+
+fn encode_decision(d: Decision) -> HeaderValue {
+    let s = match d {
+        Decision::Free => "free".to_string(),
+        Decision::Deny => "deny".to_string(),
+        Decision::Paid { micro_usdc } => format!("paid:{micro_usdc}"),
+    };
+    // Always plain ASCII, so this cannot fail.
+    HeaderValue::from_str(&s).expect("decision encoding is ASCII")
+}
+
+fn decode_decision(v: Option<&HeaderValue>) -> Option<Decision> {
+    match v?.to_str().ok()? {
+        "free" => Some(Decision::Free),
+        "deny" => Some(Decision::Deny),
+        s => Some(Decision::Paid {
+            micro_usdc: s.strip_prefix("paid:")?.parse().ok()?,
+        }),
+    }
+}
+
 /// Reverse-proxy the request to the origin. Payment enforcement happens in
 /// the x402 layer before this runs; the gateway itself never touches the
 /// chain. Paths no rule covers are refused here (the layer attaches no price
@@ -129,7 +241,13 @@ async fn proxy(State(st): State<Arc<AppState>>, req: Request) -> Response {
         return (StatusCode::BAD_REQUEST, "malformed path").into_response();
     }
     let caller = caller_id(req.headers());
-    let decision = st.rules.decide(req.uri().path(), caller.as_deref());
+    // The decision stamped before the x402 layer — the same one the request
+    // was priced under. Fail closed if it is somehow absent.
+    let decision = req
+        .extensions()
+        .get::<Decision>()
+        .copied()
+        .unwrap_or(Decision::Deny);
     if decision == Decision::Deny {
         return (StatusCode::NOT_FOUND, "no route").into_response();
     }
@@ -179,9 +297,10 @@ async fn forward(st: &AppState, req: Request) -> anyhow::Result<Response> {
     let conn_named = connection_named(&parts.headers);
     let mut rb = st.http.request(method, &url);
     for (name, value) in &parts.headers {
-        // The caller header is an unauthenticated gateway-side pricing hint;
-        // never let it reach the origin looking like tenant identity.
-        if name.as_str() == CALLER_HEADER {
+        // The caller header is an unauthenticated gateway-side pricing hint,
+        // and the decision stamp is gateway-internal; neither may reach the
+        // origin.
+        if name.as_str() == CALLER_HEADER || name.as_str() == DECISION_HEADER {
             continue;
         }
         if !skip_header(name.as_str()) && !conn_named.contains(name.as_str()) {
@@ -202,6 +321,39 @@ async fn forward(st: &AppState, req: Request) -> anyhow::Result<Response> {
     // Stream the origin body through instead of buffering it; origin
     // responses have no size cap.
     Ok(builder.body(Body::from_stream(origin_resp.bytes_stream()))?)
+}
+
+/// Swaps freshly parsed rules tables into the shared handle.
+///
+/// `last` holds the bytes of the previous read — good or bad — so each
+/// distinct file content is parsed (and, when invalid, logged) exactly once
+/// rather than on every poll tick. Requests are unaffected by mid-flight
+/// swaps: `stamp_decision` reads the table once per request and the stamped
+/// decision travels with it.
+struct RulesReloader {
+    shared: SharedRules,
+    last: Vec<u8>,
+}
+
+impl RulesReloader {
+    /// Ok(true): new table swapped in. Ok(false): file unchanged. Err: the
+    /// new content does not parse; the running table is left untouched.
+    fn apply(&mut self, bytes: Vec<u8>) -> Result<bool, rules::RuleError> {
+        if bytes == self.last {
+            return Ok(false);
+        }
+        let parsed = std::str::from_utf8(&bytes)
+            .map_err(|e| rules::RuleError::Json(format!("rules file is not UTF-8: {e}")))
+            .and_then(|s| RuleSet::from_json(s));
+        self.last = bytes;
+        match parsed {
+            Ok(ruleset) => {
+                *self.shared.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(ruleset);
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// The caller id used for pricing, or None. Deterministic on adversarial
@@ -427,6 +579,130 @@ mod tests {
         for ok in ["/", "/a/b", "/a.b/c", "/a/b.json", "/a/..b", "/a/b/", "/a-b_c~d/e"] {
             assert!(!path_is_suspicious(ok), "{ok} should be fine");
         }
+    }
+
+    fn table(price: &str) -> String {
+        format!(r#"{{ "rules": [ {{ "prefix": "/p", "price_usdc": "{price}" }} ] }}"#)
+    }
+
+    fn price_of(shared: &SharedRules) -> Decision {
+        current_rules(shared).decide("/p", None)
+    }
+
+    #[test]
+    fn reload_swaps_a_valid_table_and_keeps_the_old_on_a_bad_one() {
+        let initial = table("0.01");
+        let shared: SharedRules = Arc::new(RwLock::new(Arc::new(
+            RuleSet::from_json(&initial).unwrap(),
+        )));
+        let mut r = RulesReloader {
+            shared: shared.clone(),
+            last: initial.into_bytes(),
+        };
+        assert_eq!(price_of(&shared), Decision::Paid { micro_usdc: 10_000 });
+
+        // Unchanged bytes: no reparse, no swap.
+        assert_eq!(r.apply(table("0.01").into_bytes()), Ok(false));
+
+        // A valid edit takes effect.
+        assert_eq!(r.apply(table("0.09").into_bytes()), Ok(true));
+        assert_eq!(price_of(&shared), Decision::Paid { micro_usdc: 90_000 });
+
+        // Malformed JSON: error out, old table keeps serving...
+        assert!(r.apply(b"{ not json".to_vec()).is_err());
+        assert_eq!(price_of(&shared), Decision::Paid { micro_usdc: 90_000 });
+
+        // ...and the same bad bytes are not reparsed on the next tick.
+        assert_eq!(r.apply(b"{ not json".to_vec()), Ok(false));
+
+        // Valid JSON that fails rule validation is rejected the same way.
+        assert!(
+            r.apply(br#"{ "rules": [ { "prefix": "/p" } ] }"#.to_vec())
+                .is_err()
+        );
+        assert_eq!(price_of(&shared), Decision::Paid { micro_usdc: 90_000 });
+
+        // Non-UTF-8 content is an error, not a panic.
+        assert!(r.apply(vec![0xff, 0xfe, 0x00]).is_err());
+        assert_eq!(price_of(&shared), Decision::Paid { micro_usdc: 90_000 });
+
+        // Recovery: fixing the file swaps the fix in.
+        assert_eq!(r.apply(table("0.05").into_bytes()), Ok(true));
+        assert_eq!(price_of(&shared), Decision::Paid { micro_usdc: 50_000 });
+    }
+
+    #[test]
+    fn decision_header_roundtrip() {
+        for d in [
+            Decision::Free,
+            Decision::Deny,
+            Decision::Paid { micro_usdc: 123 },
+        ] {
+            assert_eq!(decode_decision(Some(&encode_decision(d))), Some(d));
+        }
+        assert_eq!(decode_decision(None), None);
+        for bad in ["paid:", "paid:x", "PAID:5", "", "gratis"] {
+            assert_eq!(
+                decode_decision(Some(&HeaderValue::from_static(bad))),
+                None,
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stamp_strips_spoofed_decisions_and_stamps_both_channels() {
+        use tower::ServiceExt;
+
+        let table = r#"{ "rules": [ { "prefix": "/p", "price_usdc": "0.01" } ] }"#;
+        let rules: SharedRules =
+            Arc::new(RwLock::new(Arc::new(RuleSet::from_json(table).unwrap())));
+        let state = Arc::new(AppState {
+            origin: "http://unused".into(),
+            strip_prefix: None,
+            http: reqwest::Client::new(),
+            rules,
+            pay_to: "0x0".into(),
+            indexer_url: None,
+            indexer_token: None,
+        });
+
+        // Echo what the layers downstream of the middleware actually see.
+        async fn probe(req: Request) -> String {
+            format!(
+                "ext={:?} hdr={:?}",
+                req.extensions().get::<Decision>(),
+                req.headers()
+                    .get(DECISION_HEADER)
+                    .and_then(|v| v.to_str().ok())
+            )
+        }
+        let app = Router::new().fallback_service(any(probe).layer(
+            axum::middleware::from_fn_with_state(state, stamp_decision),
+        ));
+
+        // A client claiming "free" on a paid route gets its stamp replaced.
+        let req = axum::http::Request::builder()
+            .uri("/p")
+            .header(DECISION_HEADER, "free")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let s = String::from_utf8(body.to_vec()).unwrap();
+        assert!(s.contains("ext=Some(Paid { micro_usdc: 10000 })"), "{s}");
+        assert!(s.contains(r#"hdr=Some("paid:10000")"#), "{s}");
+
+        // Unmatched path: denied on both channels.
+        let req = axum::http::Request::builder()
+            .uri("/other")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let s = String::from_utf8(body.to_vec()).unwrap();
+        assert!(s.contains("ext=Some(Deny)"), "{s}");
+        assert!(s.contains(r#"hdr=Some("deny")"#), "{s}");
     }
 
     #[test]

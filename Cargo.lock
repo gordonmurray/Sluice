@@ -1987,6 +1987,7 @@ dependencies = [
  "rules",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "x402-axum",
