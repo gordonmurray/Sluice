@@ -160,6 +160,8 @@ services:
     environment:
       DATABASE_URL: postgres://sluice:sluice@postgres:5432/sluice
       BIND: "0.0.0.0:8090"
+      # Shared secret for /receipts; dev-only value, matches the gateway's.
+      INDEXER_TOKEN: sluice-dev-indexer-token
       RUST_LOG: info
 
   seed-firn:
@@ -196,6 +198,7 @@ services:
       RULES_PATH: /app/rules.json
       STRIP_PREFIX: /firn
       INDEXER_URL: http://indexer:8090
+      INDEXER_TOKEN: sluice-dev-indexer-token
       RUST_LOG: info,gateway=debug
 
   client:
