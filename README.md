@@ -25,7 +25,7 @@ client ──► gateway (axum + x402-axum) ──► origin (any HTTP service)
 ```
 
 The demo meters pay-per-query search at $0.05 a query ($0.02 for one
-configured caller, authenticated by API key — `config/callers.json` maps
+configured caller, authenticated by API key: `config/callers.json` maps
 keys to caller ids, presented as `x-sluice-api-key`; unauthenticated caller
 claims are priced at the base rate). Out of the box the origin is a small
 built-in search stand-in, so this repo alone runs the whole loop; the
@@ -58,7 +58,7 @@ Everything runs in docker. Anvil forks Base mainnet, so the real USDC
 bytecode runs against real forked state locally, with no real-money
 settlement.
 
-A fresh clone of this repo is all you need — the default origin is the
+A fresh clone of this repo is all you need; the default origin is the
 built-in demo search service:
 
 ```sh
@@ -85,15 +85,92 @@ One client run pays for two searches (50000 + 20000 micro-USDC, six
 decimals), so the pay-to balance grows by 70000 per run. The same settlements
 are queryable in Postgres and visible in Grafana at
 `localhost:3001/d/sluice-payments` (revenue, paid requests, settle latency,
-and gateway request rates/latency by pricing decision — the gateway exposes
+and gateway request rates/latency by pricing decision). The gateway exposes
 Prometheus metrics at `/metrics`; that path and `/healthz` are the gateway's
 own and are never proxied, though an origin's endpoints stay reachable under
-their prefix, e.g. `/firn/metrics`).
+their prefix, e.g. `/firn/metrics`.
+
+This is the dashboard after a few minutes of demo traffic on the fork: 34
+paid requests, $1.37 of fake USDC, and one request that paid, hit a stopped
+origin, and landed in the refund queue. Settle latency sits around 7.5 s p50
+here; most of that is waiting for the next anvil block, mined every 5
+seconds on the fork.
+
+![Grafana: revenue, paid requests, settle latency, and gateway decisions](docs/images/grafana-dashboard.png)
+
+The decision panel separates quotes from sales: `paid / 402` is a price
+quote served, `paid / 200` is a settled request that reached the origin,
+`deny / 404` is a path no rule covers, and `paid / 502` is the one that
+belongs in the refund queue.
+
+![Grafana: gateway requests by pricing decision](docs/images/grafana-requests-by-decision.png)
+
+### The same loop with curl
+
+The demo client hides the wire format, so here it is in the raw. A request
+without payment gets the quote:
+
+```
+$ curl -i -X POST localhost:8080/firn/ns/demo/query \
+    -H 'content-type: application/json' \
+    -d '{"text": "gasless payments without ETH", "k": 3}'
+
+HTTP/1.1 402 Payment Required
+payment-required: eyJ4NDAyVmVyc2lvbiI6MiwiZXJyb3IiOiJQYXltZW50LVNpZ25hdHVyZSBoZWFkZXIgaXMg…
+content-length: 0
+```
+
+The `payment-required` header is base64. Decoded, it says exactly what to
+sign: 50000 micro-USDC (six decimals, so $0.05) to the pay-to address, USDC
+on Base, EIP-3009:
+
+```json
+{
+  "x402Version": 2,
+  "accepts": [{
+    "scheme": "exact",
+    "network": "eip155:8453",
+    "amount": "50000",
+    "payTo": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+    "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "extra": { "assetTransferMethod": "eip3009", "name": "USD Coin", "version": "2" }
+  }]
+}
+```
+
+Paying is signing an EIP-712 `transferWithAuthorization` for that exact
+amount and retrying with the result in a `Payment-Signature` header.
+`scripts/pay-with-curl.sh` does the whole exchange with curl, `cast` (run
+inside the anvil container) and python3, no x402 client library:
+
+```
+$ ./scripts/pay-with-curl.sh
+
+HTTP/1.1 200 OK
+content-type: application/json
+payment-response: eyJuZXR3b3JrIjoiZWlwMTU1Ojg0NTMiLCJwYXllciI6IjB4YTc0OTBGRkQ2ZkZBRjlDNjI5…
+
+{"results":[{"id":1,"score":0.25,"text":"x402 is an open protocol for HTTP-native payments: …
+```
+
+The `payment-response` header decodes to the settlement receipt, on-chain
+before the origin did any work:
+
+```json
+{
+  "network": "eip155:8453",
+  "payer": "0xa7490FFD6fFAF9C629a1E1Be4875E6b7700943DA",
+  "success": true,
+  "transaction": "0xb796b89437aec331092839cdc967c7229d5f27d1cf9539dc7c6f8d8ce9a8aa7e"
+}
+```
+
+### Offline mode
 
 No internet (or a flaky RPC)? The offline override skips the fork entirely:
 anvil runs a fresh chain with Base's chain id, and a minimal EIP-3009 token
 (`contracts/MockUSDC.sol`, pre-compiled so no compiler is needed) stands in
-for USDC, mirroring its EIP-712 domain fields (name, version, chain id —
+for USDC, mirroring its EIP-712 domain fields (name, version, chain id;
 the verifying contract necessarily differs, so signatures are not portable
 between the forked and offline chains). The x402 infrastructure contracts the
 facilitator expects on-chain are installed from committed bytecode
@@ -103,6 +180,8 @@ snapshots. Nothing dials out:
 docker compose -f docker-compose.yml -f docker-compose.offline.yml up -d --build
 docker compose -f docker-compose.yml -f docker-compose.offline.yml run --rm client
 ```
+
+### Metering Firn instead
 
 To meter the real Firn instead of the built-in stand-in, clone it next to
 this repo and add the override:
@@ -117,17 +196,7 @@ Every credential in the compose files (private keys, Postgres, Grafana, and
 MinIO in the Firn override) is a local demo value for the fork, and none of them are suitable
 for a deployment.
 
-## Repo layout
-
-| Path | What |
-|---|---|
-| `gateway/` | axum reverse proxy with x402-axum payment enforcement |
-| `client/` | test client over x402-reqwest; proves the paid loop |
-| `rules/` | route/caller to price policy, table-driven |
-| `indexer/` | settlement receipts to Postgres |
-| `config/` | mounted service configs, rules table, Grafana provisioning |
-| `scripts/` | USDC funding on the fork, Firn seeding, dockerised cargo |
-| `docs/` | build notes and [gotchas](docs/gotchas.md) hit along the way |
+## Pricing
 
 Prices live in `config/rules.json` and hot-reload: the gateway re-reads the
 file every couple of seconds (`RULES_RELOAD_SECS`, 0 disables) and swaps the
