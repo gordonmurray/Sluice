@@ -191,7 +191,7 @@ impl RuleSet {
                 caller_prices,
             });
         }
-        rules.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        rules.sort_by_key(|b| std::cmp::Reverse(b.prefix.len()));
         Ok(RuleSet { rules })
     }
 
@@ -202,10 +202,10 @@ impl RuleSet {
             if !path_has_prefix(path, &rule.prefix) {
                 continue;
             }
-            if let Some(caller) = caller {
-                if let Some(&micro_usdc) = rule.caller_prices.get(caller) {
-                    return Decision::Paid { micro_usdc };
-                }
+            if let Some(caller) = caller
+                && let Some(&micro_usdc) = rule.caller_prices.get(caller)
+            {
+                return Decision::Paid { micro_usdc };
             }
             return rule.base;
         }
