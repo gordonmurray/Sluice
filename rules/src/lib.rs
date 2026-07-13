@@ -69,19 +69,34 @@ impl fmt::Display for RuleError {
                 write!(f, "rule {prefix:?}: {price:?} is not a valid USDC amount")
             }
             RuleError::NoPricing { prefix } => {
-                write!(f, "rule {prefix:?} needs either pricing=\"free\" or price_usdc")
+                write!(
+                    f,
+                    "rule {prefix:?} needs either pricing=\"free\" or price_usdc"
+                )
             }
             RuleError::ConflictingPricing { prefix } => {
-                write!(f, "rule {prefix:?} has both pricing=\"free\" and price_usdc")
+                write!(
+                    f,
+                    "rule {prefix:?} has both pricing=\"free\" and price_usdc"
+                )
             }
             RuleError::UnknownPricing { prefix, pricing } => {
-                write!(f, "rule {prefix:?}: unknown pricing {pricing:?} (only \"free\" is valid)")
+                write!(
+                    f,
+                    "rule {prefix:?}: unknown pricing {pricing:?} (only \"free\" is valid)"
+                )
             }
             RuleError::CallerPricesOnFree { prefix } => {
-                write!(f, "rule {prefix:?} is free but sets caller_prices; remove one")
+                write!(
+                    f,
+                    "rule {prefix:?} is free but sets caller_prices; remove one"
+                )
             }
             RuleError::BadPrefix { prefix } => {
-                write!(f, "rule prefix {prefix:?} must be an absolute path starting with '/'")
+                write!(
+                    f,
+                    "rule prefix {prefix:?} must be an absolute path starting with '/'"
+                )
             }
             RuleError::DuplicatePrefix { prefix } => {
                 write!(f, "duplicate rule prefix {prefix:?}")
@@ -132,7 +147,10 @@ impl RuleSet {
             if !r.prefix.starts_with('/') {
                 return Err(RuleError::BadPrefix { prefix: r.prefix });
             }
-            if rules.iter().any(|existing: &Rule| existing.prefix == r.prefix) {
+            if rules
+                .iter()
+                .any(|existing: &Rule| existing.prefix == r.prefix)
+            {
                 return Err(RuleError::DuplicatePrefix { prefix: r.prefix });
             }
             let base = match (r.pricing.as_deref(), &r.price_usdc) {
@@ -394,10 +412,9 @@ mod tests {
 
     #[test]
     fn bad_price_is_rejected_at_load() {
-        let err = RuleSet::from_json(
-            r#"{ "rules": [ { "prefix": "/x", "price_usdc": "0.0000001" } ] }"#,
-        )
-        .unwrap_err();
+        let err =
+            RuleSet::from_json(r#"{ "rules": [ { "prefix": "/x", "price_usdc": "0.0000001" } ] }"#)
+                .unwrap_err();
         assert!(matches!(err, RuleError::BadPrice { .. }));
     }
 

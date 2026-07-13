@@ -355,11 +355,7 @@ async fn healthz() -> impl IntoResponse {
 /// extensions). One read of the live rules table per request means a
 /// concurrent reload cannot split a request across two tables — priced
 /// under one, forwarded (or denied) under another.
-async fn stamp_decision(
-    State(st): State<Arc<AppState>>,
-    mut req: Request,
-    next: Next,
-) -> Response {
+async fn stamp_decision(State(st): State<Arc<AppState>>, mut req: Request, next: Next) -> Response {
     // Never trust an inbound stamp.
     req.headers_mut().remove(DECISION_HEADER);
     // Identity comes from the API key alone; a bare x-sluice-caller claim
@@ -505,9 +501,7 @@ async fn forward(st: &AppState, req: Request) -> anyhow::Result<Response> {
     let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(_) => {
-            return Ok(
-                (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response()
-            );
+            return Ok((StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response());
         }
     };
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?;
@@ -619,9 +613,7 @@ fn single_header_value<'h>(headers: &'h axum::http::HeaderMap, name: &str) -> Op
 /// discard the other, reassigning a credential on a bad merge), and keys and
 /// caller ids must be non-empty with no surrounding whitespace (a padded
 /// caller id would silently fail to match its rules entry).
-fn parse_caller_keys(
-    json: &str,
-) -> anyhow::Result<std::collections::HashMap<String, String>> {
+fn parse_caller_keys(json: &str) -> anyhow::Result<std::collections::HashMap<String, String>> {
     struct KeyMap(std::collections::HashMap<String, String>);
     impl<'de> serde::Deserialize<'de> for KeyMap {
         fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -873,7 +865,15 @@ mod tests {
         ] {
             assert!(path_is_suspicious(bad), "{bad} should be suspicious");
         }
-        for ok in ["/", "/a/b", "/a.b/c", "/a/b.json", "/a/..b", "/a/b/", "/a-b_c~d/e"] {
+        for ok in [
+            "/",
+            "/a/b",
+            "/a.b/c",
+            "/a/b.json",
+            "/a/..b",
+            "/a/b/",
+            "/a-b_c~d/e",
+        ] {
             assert!(!path_is_suspicious(ok), "{ok} should be fine");
         }
     }
@@ -889,9 +889,8 @@ mod tests {
     #[test]
     fn reload_swaps_a_valid_table_and_keeps_the_old_on_a_bad_one() {
         let initial = table("0.01");
-        let shared: SharedRules = Arc::new(RwLock::new(Arc::new(
-            RuleSet::from_json(&initial).unwrap(),
-        )));
+        let shared: SharedRules =
+            Arc::new(RwLock::new(Arc::new(RuleSet::from_json(&initial).unwrap())));
         let mut r = RulesReloader {
             shared: shared.clone(),
             last: initial.into_bytes(),
@@ -995,7 +994,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
         let headers = resp.headers().clone();
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         (status, headers, body)
     }
 
@@ -1234,12 +1235,7 @@ mod tests {
         });
         let app = build_app(state, "http://127.0.0.1:1", Address::ZERO, USDC::base()).unwrap();
 
-        let count = || {
-            metrics()
-                .requests
-                .with_label_values(&["free", "404"])
-                .get()
-        };
+        let count = || metrics().requests.with_label_values(&["free", "404"]).get();
         let before = count();
         let (status, _, _) = send(
             app.clone(),
@@ -1551,9 +1547,9 @@ mod tests {
                     .and_then(|v| v.to_str().ok())
             )
         }
-        let app = Router::new().fallback_service(any(probe).layer(
-            axum::middleware::from_fn_with_state(state, stamp_decision),
-        ));
+        let app = Router::new().fallback_service(
+            any(probe).layer(axum::middleware::from_fn_with_state(state, stamp_decision)),
+        );
 
         // A client claiming "free" on a paid route gets its stamp replaced.
         let req = axum::http::Request::builder()
@@ -1618,7 +1614,10 @@ mod tests {
         h.insert(API_KEY_HEADER, HeaderValue::from_static(""));
         assert_eq!(resolve_caller(&h, &test_keys()), None);
         let mut h = HeaderMap::new();
-        h.insert(API_KEY_HEADER, HeaderValue::from_bytes(b"\xff\xfe").unwrap());
+        h.insert(
+            API_KEY_HEADER,
+            HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
+        );
         assert_eq!(resolve_caller(&h, &test_keys()), None);
 
         // Credentials match byte-exactly: a padded key is an unknown key.
@@ -1643,8 +1642,6 @@ mod tests {
         assert!(parse_caller_keys(r#"{ "keys": { "k ": "tenant-a" } }"#).is_err());
         assert!(parse_caller_keys(r#"{ "keys": { "k": "tenant-a " } }"#).is_err());
         // A duplicated key must fail loudly, not silently pick one mapping.
-        assert!(
-            parse_caller_keys(r#"{ "keys": { "k": "tenant-a", "k": "tenant-b" } }"#).is_err()
-        );
+        assert!(parse_caller_keys(r#"{ "keys": { "k": "tenant-a", "k": "tenant-b" } }"#).is_err());
     }
 }
