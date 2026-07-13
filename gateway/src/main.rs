@@ -279,10 +279,7 @@ fn asset_from_env() -> anyhow::Result<Eip155TokenDeployment> {
         chain_reference: Eip155ChainReference::new(chain_id),
         address,
         decimals,
-        transfer_method: AssetTransferMethod::Eip3009 {
-            name: name.into(),
-            version: version.into(),
-        },
+        transfer_method: AssetTransferMethod::Eip3009 { name, version },
     })
 }
 
@@ -559,7 +556,7 @@ impl RulesReloader {
         }
         let parsed = std::str::from_utf8(&bytes)
             .map_err(|e| rules::RuleError::Json(format!("rules file is not UTF-8: {e}")))
-            .and_then(|s| RuleSet::from_json(s));
+            .and_then(RuleSet::from_json);
         self.last = bytes;
         match parsed {
             Ok(ruleset) => {
