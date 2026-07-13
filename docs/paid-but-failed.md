@@ -28,7 +28,7 @@ the outcome) and deserve the benefit of the doubt.
 - A blind origin retry turns every non-idempotent paid request (POST bodies,
   writes) into a double-execution risk the gateway cannot judge.
 - Credits mean the gateway starts keeping balances, which is state it does
-  not otherwise have and a scope boundary worth defending (see CLAUDE.md).
+  not otherwise have and a scope boundary worth defending.
 - Recording the outcome and refunding out of band keeps the gateway
   stateless and the money trail auditable: the chain has the settlement, the
   table has what it bought.
