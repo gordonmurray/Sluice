@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-14
+
 ### Added
 
 - Pay-per-request gateway implementing the x402 `exact` scheme: an unpaid request to a metered path returns `402 Payment Required` with base64-encoded x402 requirements (price, asset, network, pay-to address) in a `payment-required` header, and a request carrying a signed EIP-3009 authorisation is verified and settled through a facilitator, then proxied to the origin. USDC on Base, gasless for the client.
@@ -25,4 +27,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Continuous integration running the workspace test suite on pull requests and `main`.
 - Documentation: a README covering what Sluice is and the paid-request flow with a raw-curl walkthrough, `docs/testnet.md` (Base Sepolia prerequisites), and `docs/paid-but-failed.md` (the paid-but-failed policy).
 
-[Unreleased]: https://github.com/gordonmurray/Sluice/commits/main
+[Unreleased]: https://github.com/gordonmurray/Sluice/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/gordonmurray/Sluice/releases/tag/v0.1.0
