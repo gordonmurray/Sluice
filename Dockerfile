@@ -1,5 +1,5 @@
 # Builds the sluice gateway and test client. The host only needs docker and
-# cargo (see CLAUDE.md); the release binaries are produced here.
+# cargo; the release binaries are produced here.
 
 FROM rust:1.96-bookworm AS builder
 

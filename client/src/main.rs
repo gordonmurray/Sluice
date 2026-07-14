@@ -42,7 +42,9 @@ async fn main() -> anyhow::Result<()> {
     println!("POST /firn/ns/demo/query (no payment) -> {status}");
     println!(
         "  payment-required (base64): {}",
-        header(&res, "payment-required").as_deref().unwrap_or("<missing>")
+        header(&res, "payment-required")
+            .as_deref()
+            .unwrap_or("<missing>")
     );
     anyhow::ensure!(
         status == reqwest::StatusCode::PAYMENT_REQUIRED,
@@ -71,7 +73,10 @@ async fn main() -> anyhow::Result<()> {
     );
     anyhow::ensure!(status.is_success(), "paid search failed with {status}");
     anyhow::ensure!(
-        !body["results"].as_array().map(Vec::is_empty).unwrap_or(true),
+        !body["results"]
+            .as_array()
+            .map(Vec::is_empty)
+            .unwrap_or(true),
         "paid search returned no results"
     );
 
@@ -116,9 +121,14 @@ async fn main() -> anyhow::Result<()> {
     println!("POST /firn/ns/demo/query (x402, api key tenant-a) -> {status}");
     println!(
         "  payment-response (base64): {}",
-        header(&res, "payment-response").as_deref().unwrap_or("<missing>")
+        header(&res, "payment-response")
+            .as_deref()
+            .unwrap_or("<missing>")
     );
-    anyhow::ensure!(status.is_success(), "per-caller paid search failed with {status}");
+    anyhow::ensure!(
+        status.is_success(),
+        "per-caller paid search failed with {status}"
+    );
 
     // 5. Admin writes are not exposed: no rule covers upsert.
     let res = plain
@@ -158,7 +168,9 @@ fn print_hits(body: &serde_json::Value) {
             let text: String = text.chars().take(70).collect();
             println!(
                 "  hit id={} score={:.3} {}…",
-                hit["id"], hit["score"].as_f64().unwrap_or(0.0), text
+                hit["id"],
+                hit["score"].as_f64().unwrap_or(0.0),
+                text
             );
         }
     }

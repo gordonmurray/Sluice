@@ -99,10 +99,7 @@ async fn require_token(State(app): State<Arc<App>>, req: Request, next: Next) ->
     next.run(req).await
 }
 
-async fn ingest(
-    State(app): State<Arc<App>>,
-    Json(r): Json<Receipt>,
-) -> impl IntoResponse {
+async fn ingest(State(app): State<Arc<App>>, Json(r): Json<Receipt>) -> impl IntoResponse {
     let res = sqlx::query(
         "INSERT INTO payments
              (tx_hash, network, payer, pay_to, amount_micro_usdc, path, caller, success,
@@ -208,10 +205,7 @@ mod tests {
         }))
     }
 
-    async fn status_of(
-        auth: Option<&'static str>,
-        body: &'static str,
-    ) -> StatusCode {
+    async fn status_of(auth: Option<&'static str>, body: &'static str) -> StatusCode {
         use tower::ServiceExt;
         let mut req = axum::http::Request::builder()
             .method("POST")

@@ -62,7 +62,7 @@ services:
     # clone of this repo alone runs the full paid loop; docker-compose.firn.yml
     # overrides this same service to build Firn instead (a true swap — same
     # service name, so nothing extra runs or gates the gateway). Pluggable:
-    # any HTTP origin works (see CLAUDE.md scope guardrails).
+    # any HTTP origin works.
     build:
       context: .
     container_name: sluice-origin

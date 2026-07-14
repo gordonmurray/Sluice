@@ -19,7 +19,7 @@ tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# x402 (pulled in, not forked — see CLAUDE.md)
+# x402 crates: depend on x402-rs, do not fork
 x402-axum = "2.0"
 x402-chain-eip155 = "2.0"
 x402-reqwest = "2.0"
