@@ -47,3 +47,53 @@ A Base Sepolia integration against CDP completed a real test-token settlement an
 
 The offline payment smoke still passed with two indexed receipts and the expected receiver balance delta.
 A recovery drill copied the testnet journal, removed its recorded outcome, and reconstructed the successful transfer from chain logs without a new payment.
+
+## Optional gateway analytics
+
+Set `GOATCOUNTER_CONFIG_PATH` to a public configuration file and `GOATCOUNTER_TOKEN_PATH`
+to a protected file containing only the API token. With no config path, analytics is disabled.
+A configuration example:
+
+```json
+{
+  "site": "https://example.goatcounter.com",
+  "environment": "production",
+  "routes": [
+    {"path": "/api/items/", "prefix": true, "label": "item"},
+    {"path": "/docs", "label": "docs"}
+  ]
+}
+```
+
+Prefix paths must end with `/`. Route labels and environments accept only lowercase ASCII
+letters, digits and hyphens. Unmapped paths, health checks and metrics are excluded.
+Events use `/gateway/{environment}/{audience}/{route}/{outcome}/{status}`.
+The gateway observes the final response status rather than an origin preparation response.
+
+- `quote`: unsigned request returned 402.
+- `payment-rejected`: malformed or rejected payment; no purchase is inferred from a signature.
+- `purchase-first` and `purchase-repeat`: new successful settlements committed to the journal.
+  Repeat means a prior settled entry exists for the same payer and network in the retained journal.
+  It does not identify a person, and rebuilding or pruning the journal changes this classification.
+- `purchase`: successful settlement when journal-based payer classification is unavailable.
+- `replay`: retrieval of an existing stored response. It is not another settlement.
+- `payment-unknown`: uncertain provider or journal outcome, requiring reconciliation.
+- `request-rejected`, `rate-limited`, `service-error` and `response`: other final results.
+
+A successful purchase event records settlement and the response status, not proof that the
+client received the complete body. Reconciliation outside the request path does not backfill events.
+A request with `X-Sluice-Test: 1` is labelled `test`. User-agent categories are self-reported:
+`llm-reported`, `crawler-reported`, `browser`, or `api-other`. They are not authenticated identities.
+Raw paths, query strings, request bodies, IPs, user agents, API keys, payer addresses and
+payment signatures are never included in the event. Payer comparisons stay inside the journal.
+
+The in-memory queue holds 1,024 events. At most 100 events are sent each ten seconds, with a
+five-second timeout and no redirects. Failures do not block requests. No automatic retry is made
+because an ambiguous response could duplicate events. Queued events can be lost on process exit.
+The private `sluice_gateway_analytics_events_total` metric reports `delivered`, `failed`, and
+`queue-full` counts. GoatCounter events are best-effort usage statistics, not the revenue ledger.
+Do not sum origin preparation events, gateway events and browser pageviews as unique users.
+
+Offline tests cover privacy, bounded queues, quote/purchase/repeat/replay classification,
+malformed payments, and uncertain settlement. Production deployments should also check accepted
+GoatCounter events and compare new purchases against the durable journal.

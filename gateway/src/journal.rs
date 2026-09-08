@@ -3,6 +3,7 @@
 //! Unknown settlement outcomes fail closed; no automatic second authorization.
 use crate::{
     AppState, Decision,
+    analytics::{self, Outcome},
     facilitator::{ClientKind, Error},
 };
 use axum::{
@@ -48,6 +49,17 @@ impl Journal {
         c.execute("INSERT INTO attempts(id,binding,authorization,body,headers,phase,authorization_details) VALUES(?1,?2,?3,?4,?5,'prepared',?6) ON CONFLICT(id) DO NOTHING",
             params![p.id,p.binding,authorization,p.body,serde_json::to_string(&p.headers).map_err(|_|Error::Journal)?,details.to_string()]).map_err(|_|Error::Journal)?;
         Ok(())
+    }
+    fn purchase_outcome(&self, id: &str) -> Outcome {
+        let Ok(c) = self.0.lock() else {
+            return Outcome::Purchase;
+        };
+        let previous = c.query_row("SELECT EXISTS(SELECT 1 FROM attempts old JOIN attempts current ON current.id=?1 WHERE old.id != current.id AND old.phase='settled' AND lower(json_extract(old.authorization_details,'$.payer'))=lower(json_extract(current.authorization_details,'$.payer')) AND json_extract(old.authorization_details,'$.network')=json_extract(current.authorization_details,'$.network'))", [id], |r| r.get::<_,bool>(0));
+        match previous {
+            Ok(true) => Outcome::RepeatPurchase,
+            Ok(false) => Outcome::FirstPurchase,
+            Err(_) => Outcome::Purchase,
+        }
     }
     fn get(&self, id: &str) -> Result<Option<(Prepared, String, Option<String>)>, Error> {
         let c = self.0.lock().map_err(|_| Error::Journal)?;
@@ -144,6 +156,9 @@ impl Facilitator for Guarded {
     }
     async fn verify(&self, request: &VerifyRequest) -> Result<VerifyResponse, Error> {
         let response = self.client.verify(request).await?;
+        if response.0["isValid"] != true {
+            analytics::mark(Outcome::Rejected);
+        }
         if response.0["isValid"] == true
             && let Some(journal) = &self.journal
         {
@@ -177,11 +192,20 @@ impl Facilitator for Guarded {
                 return Err(Error::InvalidPayment);
             }
             journal.claim(&id)?; // Full-sync commit precedes the external side effect.
+            analytics::mark(Outcome::Unknown);
             let response = self.client.settle(request).await?;
             journal.finish(&id, &response)?;
+            if response.0["success"] == true {
+                analytics::mark(journal.purchase_outcome(&id));
+            }
             Ok(response)
         } else {
-            self.client.settle(request).await
+            analytics::mark(Outcome::Unknown);
+            let response = self.client.settle(request).await?;
+            if response.0["success"] == true {
+                analytics::mark(Outcome::Purchase);
+            }
+            Ok(response)
         }
     }
 }
@@ -264,7 +288,10 @@ pub async fn guard(State(st): State<Arc<AppState>>, req: Request, next: Next) ->
     let binding = format!("GET {}", req.uri());
     let payment = match payment_id(req.headers()) {
         Ok(v) => v,
-        Err(_) => return failure(StatusCode::BAD_REQUEST, "invalid_payment"),
+        Err(_) => {
+            analytics::mark(Outcome::Rejected);
+            return failure(StatusCode::BAD_REQUEST, "invalid_payment");
+        }
     };
     if let Some((id, payload)) = &payment {
         let Some(base) = &st.public_base else {
@@ -280,6 +307,7 @@ pub async fn guard(State(st): State<Arc<AppState>>, req: Request, next: Next) ->
                 }
                 match phase.as_str() {
                     "settled" => {
+                        analytics::replay();
                         return response(&p, settlement.as_deref()).unwrap_or_else(|_| {
                             failure(StatusCode::SERVICE_UNAVAILABLE, "journal_unavailable")
                         });
@@ -287,6 +315,7 @@ pub async fn guard(State(st): State<Arc<AppState>>, req: Request, next: Next) ->
                     "prepared" => return run_guarded(journal, p, req, next).await,
                     "rejected" => return failure(StatusCode::PAYMENT_REQUIRED, "payment_rejected"),
                     _ => {
+                        analytics::mark(Outcome::Unknown);
                         return failure(StatusCode::SERVICE_UNAVAILABLE, "payment_outcome_unknown");
                     }
                 }
@@ -345,11 +374,13 @@ async fn run_guarded(journal: &Journal, prepared: Prepared, req: Request, next: 
     if !id.is_empty() {
         match journal.get(&id) {
             Ok(Some((p, phase, settlement))) if phase == "settled" => {
+                analytics::replay();
                 return response(&p, settlement.as_deref()).unwrap_or_else(|_| {
                     failure(StatusCode::SERVICE_UNAVAILABLE, "journal_unavailable")
                 });
             }
             Ok(Some((_, phase, _))) if matches!(phase.as_str(), "settling" | "uncertain") => {
+                analytics::mark(Outcome::Unknown);
                 return failure(StatusCode::SERVICE_UNAVAILABLE, "payment_outcome_unknown");
             }
             Ok(Some((_, phase, _))) if phase == "prepared" => {
@@ -431,6 +462,22 @@ mod integration {
         reads: Arc<AtomicUsize>,
         uncertain: bool,
     ) -> Router {
+        app_with_analytics(
+            file,
+            settles,
+            reads,
+            uncertain,
+            analytics::Analytics::default(),
+        )
+        .await
+    }
+    async fn app_with_analytics(
+        file: &str,
+        settles: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+        uncertain: bool,
+        analytics: analytics::Analytics,
+    ) -> Router {
         let origin = server(Router::new().fallback(move |req: Request| {
             let reads = reads.clone();
             async move {
@@ -452,6 +499,7 @@ mod integration {
                 Json(json!({"success":true,"network":"eip155:8453","payer":"0x1111111111111111111111111111111111111111","transaction":"0xabc"})).into_response()
             }}))).await;
         let state = Arc::new(AppState {
+            analytics,
             journal: Some(Arc::new(Journal::open(file).unwrap())),
             public_base: Some("https://example.test".into()),
             origin,
@@ -493,6 +541,112 @@ mod integration {
         )
         .unwrap();
         STANDARD.encode(json!({"x402Version":2,"resource":quote["resource"],"accepted":quote["accepts"][0],"payload":{"signature":format!("0x{}","11".repeat(65)),"authorization":{"from":"0x1111111111111111111111111111111111111111","to":"0x2222222222222222222222222222222222222222","value":"1000","validAfter":"0","validBefore":"9999999999","nonce":format!("0x{}","22".repeat(32))}}}).to_string())
+    }
+    #[tokio::test]
+    async fn analytics_distinguishes_quote_purchase_repeat_replay_and_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (analytics, mut events) = analytics::Analytics::capture();
+        let settles = Arc::new(AtomicUsize::new(0));
+        let router = app_with_analytics(
+            dir.path().join("journal.db").to_str().unwrap(),
+            settles.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            false,
+            analytics,
+        )
+        .await;
+        let paid = payment(&router).await;
+        assert!(
+            events.recv().await.unwrap()["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/quote/402")
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(request(Some(&paid)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert!(
+            events.recv().await.unwrap()["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/purchase-first/200")
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(request(Some(&paid)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert!(
+            events.recv().await.unwrap()["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/replay/200")
+        );
+        let mut second: Value = serde_json::from_slice(&STANDARD.decode(&paid).unwrap()).unwrap();
+        second["payload"]["authorization"]["nonce"] = json!(format!("0x{}", "33".repeat(32)));
+        let second = STANDARD.encode(second.to_string());
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(request(Some(&second)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert!(
+            events.recv().await.unwrap()["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/purchase-repeat/200")
+        );
+        assert_eq!(
+            router
+                .oneshot(request(Some("not-base64")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            events.recv().await.unwrap()["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/payment-rejected/400")
+        );
+        assert_eq!(settles.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn analytics_marks_uncertain_settlement_without_claiming_purchase() {
+        let dir = tempfile::tempdir().unwrap();
+        let (analytics, mut events) = analytics::Analytics::capture();
+        let router = app_with_analytics(
+            dir.path().join("journal.db").to_str().unwrap(),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            true,
+            analytics,
+        )
+        .await;
+        let paid = payment(&router).await;
+        events.recv().await.unwrap();
+        router.oneshot(request(Some(&paid))).await.unwrap();
+        assert!(
+            events.recv().await.unwrap()["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/payment-unknown/503")
+        );
     }
     #[tokio::test]
     async fn replay_keeps_snapshot_and_settles_once_across_restart() {

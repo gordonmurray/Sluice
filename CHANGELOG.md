@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Optional privacy-preserving GoatCounter gateway events for quotes, rejected payments, first/repeat purchases, stored-response replays and uncertain outcomes, with bounded delivery and private delivery metrics.
+
 - Request-bound Ed25519 CDP authentication and public HTTPS resource URLs.
 - Optional durable delivery for bounded paid GET responses, including identical replay and fail-closed uncertain outcomes.
 - Payment-signature stripping before origin forwarding and a read-only-first chain reconciliation tool.

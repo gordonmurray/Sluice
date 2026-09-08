@@ -1,3 +1,4 @@
+mod analytics;
 mod facilitator;
 mod journal;
 use std::{
@@ -51,6 +52,7 @@ const DECISION_HEADER: &str = "x-sluice-decision";
 type SharedRules = Arc<RwLock<Arc<RuleSet>>>;
 
 struct AppState {
+    analytics: analytics::Analytics,
     origin: String,
     journal: Option<Arc<journal::Journal>>,
     public_base: Option<String>,
@@ -84,6 +86,7 @@ struct GatewayMetrics {
     registry: prometheus::Registry,
     requests: prometheus::IntCounterVec,
     duration: prometheus::HistogramVec,
+    analytics_delivery: prometheus::IntCounterVec,
 }
 
 fn metrics() -> &'static GatewayMetrics {
@@ -113,7 +116,19 @@ fn metrics() -> &'static GatewayMetrics {
         registry
             .register(Box::new(duration.clone()))
             .expect("first registration");
+        let analytics_delivery = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "sluice_gateway_analytics_events_total",
+                "Best-effort analytics event delivery",
+            ),
+            &["result"],
+        )
+        .expect("static metric definition");
+        registry
+            .register(Box::new(analytics_delivery.clone()))
+            .expect("first registration");
         GatewayMetrics {
+            analytics_delivery,
             registry,
             requests,
             duration,
@@ -232,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = Arc::new(AppState {
+        analytics: analytics::Analytics::from_env()?,
         journal: env::var("PAYMENT_JOURNAL_PATH")
             .ok()
             .map(|p| journal::Journal::open(&p).map(Arc::new))
@@ -414,7 +430,9 @@ async fn stamp_decision(State(st): State<Arc<AppState>>, mut req: Request, next:
     // a 402 quote, a denial, and a proxied response each count once, with
     // the status the client actually received.
     let start = std::time::Instant::now();
-    let resp = next.run(req).await;
+    let context = st.analytics.context(&req);
+    let (resp, outcome) = analytics::observe(next.run(req)).await;
+    st.analytics.finish(context, &resp, outcome);
     let label = decision_label(decision);
     metrics()
         .duration
@@ -1015,6 +1033,7 @@ mod tests {
     async fn full_app() -> (Router, OriginLog) {
         let (origin, log) = mock_origin().await;
         let state = Arc::new(AppState {
+            analytics: analytics::Analytics::default(),
             journal: None,
             public_base: None,
             origin,
@@ -1270,6 +1289,7 @@ mod tests {
         let table = r#"{ "rules": [ { "prefix": "/free", "pricing": "free" },
                                     { "prefix": "/metrics", "price_usdc": "9" } ] }"#;
         let state = Arc::new(AppState {
+            analytics: analytics::Analytics::default(),
             journal: None,
             public_base: None,
             origin: format!("http://{origin_addr}"),
@@ -1421,6 +1441,7 @@ mod tests {
 
         let table = r#"{ "rules": [ { "prefix": "/p", "price_usdc": "0.01" } ] }"#;
         let state = Arc::new(AppState {
+            analytics: analytics::Analytics::default(),
             journal: None,
             public_base: None,
             origin,
@@ -1577,6 +1598,7 @@ mod tests {
         let rules: SharedRules =
             Arc::new(RwLock::new(Arc::new(RuleSet::from_json(table).unwrap())));
         let state = Arc::new(AppState {
+            analytics: analytics::Analytics::default(),
             journal: None,
             public_base: None,
             origin: "http://unused".into(),
