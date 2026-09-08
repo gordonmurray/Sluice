@@ -97,3 +97,8 @@ Do not sum origin preparation events, gateway events and browser pageviews as un
 Offline tests cover privacy, bounded queues, quote/purchase/repeat/replay classification,
 malformed payments, and uncertain settlement. Production deployments should also check accepted
 GoatCounter events and compare new purchases against the durable journal.
+
+Each event includes a fresh random, event-only session value so GoatCounter counts repeated
+requests separately. It is unrelated to the caller, wallet or browser and never reused.
+The `event-id-failed` private delivery counter records a random-ID generation failure.
+Statistics for gateway event paths represent request events, not unique people.

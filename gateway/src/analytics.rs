@@ -202,8 +202,18 @@ impl Analytics {
             outcome,
             response.status().as_u16()
         );
-        let event =
-            json!({"path":path,"title":format!("{}: {}", context.route, outcome),"event":true});
+        // Fresh event-only sessions prevent anonymous hits being grouped as one
+        // visitor. They are random, unrelated to callers, and never reused.
+        let mut random = [0u8; 16];
+        if getrandom::fill(&mut random).is_err() {
+            crate::metrics()
+                .analytics_delivery
+                .with_label_values(&["event-id-failed"])
+                .inc();
+            return;
+        }
+        let session: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let event = json!({"path":path,"title":format!("{}: {}", context.route, outcome),"event":true,"session":session});
         if inner.sender.try_send(event).is_err() {
             crate::metrics()
                 .analytics_delivery
@@ -302,7 +312,16 @@ mod tests {
             &Response::new(axum::body::Body::empty()),
             Outcome::FirstPurchase,
         );
-        let hit = receiver.recv().await.unwrap().to_string();
+        let first = receiver.recv().await.unwrap();
+        analytics.finish(
+            analytics.context(&request),
+            &Response::new(axum::body::Body::empty()),
+            Outcome::FirstPurchase,
+        );
+        let second = receiver.recv().await.unwrap();
+        assert_ne!(first["session"], second["session"]);
+        assert_eq!(first["session"].as_str().unwrap().len(), 32);
+        let hit = first.to_string();
         assert!(hit.contains("/gateway/test/llm-reported/lookup/purchase-first/200"));
         for private in [
             "private-company",
