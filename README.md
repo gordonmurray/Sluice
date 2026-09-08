@@ -23,6 +23,14 @@ Sluice builds on [x402-rs](https://github.com/x402-rs/x402-rs), axum, and alloy.
 The gateway does not hold private keys or broadcast chain transactions.
 The facilitator broadcasts client-authorized transfers and pays transaction gas.
 
+## Watch a paid request
+
+![A local Sluice request returns 402, pays with mock USDC, and returns a search result with an indexed receipt](docs/images/payment-demo.gif)
+
+Recorded against the offline demo with fake funds. The recording shows a free
+health check, a decoded payment quote, a paid search, and settlement checks.
+See [recording instructions](docs/recordings/README.md) to replay or reproduce it.
+
 ## Run the complete example
 
 Install Docker Engine with Docker Compose, Bash, and Python 3. Allow several

@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Inline terminal recording of a local paid request, with the asciinema source and a repeatable recording script.
 - Public contributor guide and a plan focused on the reusable payment example.
 - Scripted local payment checks covering settlement, receiver balance, and indexed receipts.
 
