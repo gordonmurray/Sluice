@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Optional configured Bazaar declarations and payment descriptions for a GET service, with bounded configuration and no product-specific schema in the gateway.
+
+- Optional privacy-preserving GoatCounter gateway events for quotes, rejected payments, first/repeat purchases, stored-response replays and uncertain outcomes, with bounded delivery and private delivery metrics.
+
+- Request-bound Ed25519 CDP authentication and public HTTPS resource URLs.
+- Optional durable delivery for bounded paid GET responses, including identical replay and fail-closed uncertain outcomes.
+- Payment-signature stripping before origin forwarding and a read-only-first chain reconciliation tool.
+
 - Inline terminal recording of a local paid request, with the asciinema source and a repeatable recording script.
 - Public contributor guide and a plan focused on the reusable payment example.
 - Scripted local payment checks covering settlement, receiver balance, and indexed receipts.

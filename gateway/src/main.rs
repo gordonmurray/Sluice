@@ -1,3 +1,7 @@
+mod analytics;
+mod discovery;
+mod facilitator;
+mod journal;
 use std::{
     env,
     sync::{Arc, RwLock},
@@ -49,7 +53,10 @@ const DECISION_HEADER: &str = "x-sluice-decision";
 type SharedRules = Arc<RwLock<Arc<RuleSet>>>;
 
 struct AppState {
+    analytics: analytics::Analytics,
     origin: String,
+    journal: Option<Arc<journal::Journal>>,
+    public_base: Option<String>,
     strip_prefix: Option<String>,
     http: reqwest::Client,
     rules: SharedRules,
@@ -80,6 +87,7 @@ struct GatewayMetrics {
     registry: prometheus::Registry,
     requests: prometheus::IntCounterVec,
     duration: prometheus::HistogramVec,
+    analytics_delivery: prometheus::IntCounterVec,
 }
 
 fn metrics() -> &'static GatewayMetrics {
@@ -109,7 +117,19 @@ fn metrics() -> &'static GatewayMetrics {
         registry
             .register(Box::new(duration.clone()))
             .expect("first registration");
+        let analytics_delivery = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "sluice_gateway_analytics_events_total",
+                "Best-effort analytics event delivery",
+            ),
+            &["result"],
+        )
+        .expect("static metric definition");
+        registry
+            .register(Box::new(analytics_delivery.clone()))
+            .expect("first registration");
         GatewayMetrics {
+            analytics_delivery,
             registry,
             requests,
             duration,
@@ -228,6 +248,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = Arc::new(AppState {
+        analytics: analytics::Analytics::from_env()?,
+        journal: env::var("PAYMENT_JOURNAL_PATH")
+            .ok()
+            .map(|p| journal::Journal::open(&p).map(Arc::new))
+            .transpose()?,
+        public_base: env::var("PUBLIC_BASE_URL").ok(),
         origin: origin.trim_end_matches('/').to_string(),
         strip_prefix,
         http: build_http_client(origin_timeout),
@@ -292,11 +318,47 @@ fn build_app(
     pay_to: Address,
     asset: Eip155TokenDeployment,
 ) -> anyhow::Result<Router> {
-    // Settle before forwarding: the origin never does unpaid work, and the
-    // settlement lands in the request extensions for the indexer.
-    let x402 = X402Middleware::try_from(facilitator_url.to_string())
-        .map_err(|e| anyhow::anyhow!("invalid FACILITATOR_URL: {e}"))?
-        .settle_before_execution();
+    // Settle before delivery. Journal mode prepares read-only origin output
+    // first; the default demo still forwards only after settlement.
+    anyhow::ensure!(
+        state.journal.is_none() || state.public_base.is_some(),
+        "PUBLIC_BASE_URL is required for journal mode"
+    );
+    let credentials = env::var("CDP_CREDENTIALS_PATH")
+        .ok()
+        .map(|path| -> anyhow::Result<facilitator::Credentials> {
+            let bytes = std::fs::read(path).context("cannot read CDP credential file")?;
+            serde_json::from_slice(&bytes)
+                .map_err(|_| anyhow::anyhow!("invalid CDP credential file"))
+        })
+        .transpose()?;
+    let client = facilitator::ClientKind::new(facilitator_url, credentials)?;
+    let mut x402 = X402Middleware::from_facilitator(journal::Guarded {
+        client,
+        journal: state.journal.clone(),
+    })
+    .settle_before_execution();
+    if let Some(base) = &state.public_base {
+        let url: reqwest::Url = base.parse().context("invalid PUBLIC_BASE_URL")?;
+        anyhow::ensure!(
+            url.scheme() == "https"
+                && url.path() == "/"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "PUBLIC_BASE_URL must be plain HTTPS"
+        );
+        x402 = x402.with_base_url(url);
+    }
+
+    let discovery = env::var("BAZAAR_CONFIG_PATH")
+        .ok()
+        .map(|path| discovery::Discovery::load(&path))
+        .transpose()?;
+    if let Some(config) = &discovery {
+        x402 = x402.with_extension(config.bazaar.clone());
+    }
 
     // Price tags come from the decision stamped by `stamp_decision` — the
     // rules table is read exactly once per request, so a mid-request reload
@@ -320,6 +382,11 @@ fn build_app(
         }
     };
 
+    let mut payment_layer = x402.with_dynamic_price(pricer);
+    if let Some(config) = discovery {
+        payment_layer = payment_layer.with_description(config.description);
+    }
+
     // Layer order (outermost first): stamp_decision, x402, proxy — the
     // stamp must exist before the x402 layer prices the request.
     // Reserved gateway paths: /healthz and /metrics belong to the gateway
@@ -332,7 +399,11 @@ fn build_app(
         .route("/metrics", get(serve_metrics))
         .fallback_service(
             any(proxy)
-                .layer(x402.with_dynamic_price(pricer))
+                .layer(payment_layer)
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    journal::guard,
+                ))
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
                     stamp_decision,
@@ -373,7 +444,9 @@ async fn stamp_decision(State(st): State<Arc<AppState>>, mut req: Request, next:
     // a 402 quote, a denial, and a proxied response each count once, with
     // the status the client actually received.
     let start = std::time::Instant::now();
-    let resp = next.run(req).await;
+    let context = st.analytics.context(&req);
+    let (resp, outcome) = analytics::observe(next.run(req)).await;
+    st.analytics.finish(context, &resp, outcome);
     let label = decision_label(decision);
     metrics()
         .duration
@@ -449,7 +522,11 @@ async fn proxy(State(st): State<Arc<AppState>>, req: Request) -> Response {
         .flatten();
     let path = req.uri().path().to_owned();
 
-    let resp = match forward(&st, req).await {
+    let resp = match if let Some(prepared) = journal::prepared_response(st.journal.as_deref()) {
+        Ok(prepared)
+    } else {
+        forward(&st, req).await
+    } {
         Ok(resp) => resp,
         Err(err) => {
             tracing::error!(error = %err, "proxy error");
@@ -511,6 +588,8 @@ async fn forward(st: &AppState, req: Request) -> anyhow::Result<Response> {
         // like vouched tenant identity, and the decision stamp is internal.
         if name.as_str() == CALLER_HEADER
             || name.as_str() == API_KEY_HEADER
+            || name.as_str() == "payment-signature"
+            || name.as_str() == "x-payment"
             || name.as_str() == DECISION_HEADER
         {
             continue;
@@ -968,6 +1047,9 @@ mod tests {
     async fn full_app() -> (Router, OriginLog) {
         let (origin, log) = mock_origin().await;
         let state = Arc::new(AppState {
+            analytics: analytics::Analytics::default(),
+            journal: None,
+            public_base: None,
             origin,
             strip_prefix: None,
             http: build_http_client(5),
@@ -1221,6 +1303,9 @@ mod tests {
         let table = r#"{ "rules": [ { "prefix": "/free", "pricing": "free" },
                                     { "prefix": "/metrics", "price_usdc": "9" } ] }"#;
         let state = Arc::new(AppState {
+            analytics: analytics::Analytics::default(),
+            journal: None,
+            public_base: None,
             origin: format!("http://{origin_addr}"),
             strip_prefix: None,
             http: build_http_client(5),
@@ -1370,6 +1455,9 @@ mod tests {
 
         let table = r#"{ "rules": [ { "prefix": "/p", "price_usdc": "0.01" } ] }"#;
         let state = Arc::new(AppState {
+            analytics: analytics::Analytics::default(),
+            journal: None,
+            public_base: None,
             origin,
             strip_prefix: None,
             http: build_http_client(1),
@@ -1524,6 +1612,9 @@ mod tests {
         let rules: SharedRules =
             Arc::new(RwLock::new(Arc::new(RuleSet::from_json(table).unwrap())));
         let state = Arc::new(AppState {
+            analytics: analytics::Analytics::default(),
+            journal: None,
+            public_base: None,
             origin: "http://unused".into(),
             strip_prefix: None,
             http: reqwest::Client::new(),

@@ -25,7 +25,16 @@ x402-types = { workspace = true }
 
 alloy-primitives = { workspace = true }
 
-[dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 base64 = "0.22"
+ed25519-dalek = "2"
+getrandom = "0.3"
+thiserror = "2"
+
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+jsonwebtoken = "9"
+tower = { version = "0.5", features = ["util"] }
 bytes = "1"
