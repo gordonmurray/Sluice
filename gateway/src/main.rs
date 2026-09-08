@@ -1,4 +1,5 @@
 mod analytics;
+mod discovery;
 mod facilitator;
 mod journal;
 use std::{
@@ -351,6 +352,14 @@ fn build_app(
         x402 = x402.with_base_url(url);
     }
 
+    let discovery = env::var("BAZAAR_CONFIG_PATH")
+        .ok()
+        .map(|path| discovery::Discovery::load(&path))
+        .transpose()?;
+    if let Some(config) = &discovery {
+        x402 = x402.with_extension(config.bazaar.clone());
+    }
+
     // Price tags come from the decision stamped by `stamp_decision` — the
     // rules table is read exactly once per request, so a mid-request reload
     // cannot price under one table and forward under another. Free and
@@ -373,6 +382,11 @@ fn build_app(
         }
     };
 
+    let mut payment_layer = x402.with_dynamic_price(pricer);
+    if let Some(config) = discovery {
+        payment_layer = payment_layer.with_description(config.description);
+    }
+
     // Layer order (outermost first): stamp_decision, x402, proxy — the
     // stamp must exist before the x402 layer prices the request.
     // Reserved gateway paths: /healthz and /metrics belong to the gateway
@@ -385,7 +399,7 @@ fn build_app(
         .route("/metrics", get(serve_metrics))
         .fallback_service(
             any(proxy)
-                .layer(x402.with_dynamic_price(pricer))
+                .layer(payment_layer)
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
                     journal::guard,

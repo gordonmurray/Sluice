@@ -173,3 +173,16 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) for build and test commands and the
 [project plan](docs/project-plan.md) for the remaining work. CI runs Rust checks
 and the offline payment demonstration. See [local verification](docs/verification.md)
 for the latest recorded checks and their limits.
+
+### Optional Bazaar discovery
+
+Set `BAZAAR_CONFIG_PATH` to a public JSON file with `description` (1–500 characters)
+and `bazaar` (the protocol's `info`, `schema`, and optional `routeTemplate` declaration).
+This gateway option describes one GET service across its paid routes. Use it only
+when every paid route shares that contract. The configuration is copied into
+`PAYMENT-REQUIRED.extensions.bazaar`; clients must preserve the quoted extensions
+in their payment payload. Keep product schemas in the consuming repository.
+
+Use the facilitator's endpoint validator after deployment. Advertising an extension
+is not evidence of catalog indexing: confirm a settled call and query the remote
+catalog separately. No registration request or signing credential is sent by this option.

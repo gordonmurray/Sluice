@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Optional configured Bazaar declarations and payment descriptions for a GET service, with bounded configuration and no product-specific schema in the gateway.
+
 - Optional privacy-preserving GoatCounter gateway events for quotes, rejected payments, first/repeat purchases, stored-response replays and uncertain outcomes, with bounded delivery and private delivery metrics.
 
 - Request-bound Ed25519 CDP authentication and public HTTPS resource URLs.
