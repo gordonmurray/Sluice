@@ -6,12 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Public contributor guide and a plan focused on the reusable payment example.
+- Scripted local payment checks covering settlement, receiver balance, and indexed receipts.
+
+### Changed
+
+- Clarified local setup requirements and best-effort receipt delivery.
+- Excluded environment files from the Docker build context.
+- Use locked Rust dependencies and pinned base images when building application images.
+- Pin Compose dependency images and bind demo ports to localhost.
+- Include rustfmt and Clippy in the Docker development wrapper.
+- Run the offline payment check in CI.
+
 ## [0.1.0] - 2026-07-14
 
 ### Added
 
 - Pay-per-request gateway implementing the x402 `exact` scheme: an unpaid request to a metered path returns `402 Payment Required` with base64-encoded x402 requirements (price, asset, network, pay-to address) in a `payment-required` header, and a request carrying a signed EIP-3009 authorisation is verified and settled through a facilitator, then proxied to the origin. USDC on Base, gasless for the client.
-- Settle-before-forward flow: settlement lands on-chain before the request reaches the origin, so the origin never does unpaid work. The gateway holds no private key and no balance; the facilitator broadcasts the settlement and pays the gas.
+- Settle-before-forward flow: settlement lands on-chain before the request reaches the origin, so paid requests reach the origin only after settlement. The gateway holds no private key and no balance; the facilitator broadcasts the settlement and pays the gas.
 - Pluggable origins: any request/response HTTP service can be metered behind the gateway. A built-in demo search origin ships in the repo so a fresh clone runs the whole paid loop on its own, and a compose override meters Firn instead.
 - Pricing rules table in `config/rules.json` with hot reload: the gateway re-reads the file on an interval (`RULES_RELOAD_SECS`, `0` disables) and swaps the table in atomically; a malformed edit is logged and ignored while the previous table keeps serving. Pricing is a table edit, not a code change.
 - Per-caller pricing: API keys in `config/callers.json` map to caller ids presented as an `x-sluice-api-key` header; unauthenticated callers are priced at the base rate.

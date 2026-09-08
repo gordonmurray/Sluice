@@ -3,7 +3,7 @@
 # Shows the x402 wire format without the client library: fetch the 402
 # requirements, sign an EIP-3009 transferWithAuthorization (EIP-712,
 # off-chain, no gas), retry with the Payment-Signature header.
-# Rung 1 only — signs with the demo client key from docker-compose.yml
+# Local chains only: signs with the demo client key from docker-compose.yml
 # and uses cast inside the anvil container, so nothing needs installing.
 set -eu
 
