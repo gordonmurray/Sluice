@@ -2,7 +2,7 @@
 //! without any external checkout. It mimics the slice of Firn's API the demo
 //! meters — `GET /health`, `GET /metrics`, `POST /ns/{ns}/query` — over a
 //! small built-in corpus with term-overlap ranking. It is a stand-in, not a
-//! search engine; the flagship Firn demo is a compose override away
+//! search engine; the Firn demo is a compose override away
 //! (docker-compose.firn.yml).
 
 use std::env;

@@ -1,14 +1,14 @@
 #!/bin/sh
-# Run cargo inside docker. The host has no C toolchain, so linking happens in
-# the rust image; the registry cache persists in a named volume and target/
-# lives on the bind mount, so builds are incremental.
+# Run Cargo, rustfmt, and Clippy inside Docker. The registry cache persists
+# in a named volume and target/ stays on the bind mount for incremental builds.
 #
 # Usage: scripts/cargo.sh <any cargo args>, e.g. scripts/cargo.sh check
 set -eu
 cd "$(dirname "$0")/.."
+docker build -q -t sluice-rust-dev -f scripts/Dockerfile.cargo . > /dev/null
 exec docker run --rm \
     -v "$(pwd)":/w \
     -v sluice-cargo-registry:/usr/local/cargo/registry \
     -w /w \
-    rust:1.96-bookworm \
+    sluice-rust-dev \
     cargo "$@"

@@ -437,7 +437,7 @@ async fn proxy(State(st): State<Arc<AppState>>, req: Request) -> Response {
     // It is reported to the indexer only after the origin outcome is known,
     // so the receipt records what the payment actually bought — that is the
     // paid-but-failed policy (see migrations/0002): no automatic retry or
-    // refund, but every settlement lands in the payments table with the
+    // refund. The gateway attempts to report each settlement with the
     // status the client got, and refunds are an operator decision from
     // there. The cost of reporting late: a gateway crash mid-request loses
     // the receipt (fire-and-forget could always drop one; the chain remains

@@ -1,6 +1,7 @@
 /target
 .env
+.env.*
+!.env.example
 
-# local-only notes
-CLAUDE.md
+# Local working notes
 /local_docs/

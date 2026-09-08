@@ -1,61 +1,42 @@
-# Running against Base Sepolia
+# Base Sepolia example: planned
 
-The local anvil loop proves the system with no real money. The next step is
-the same stack against Base Sepolia: drop anvil and point the facilitator at
-a testnet RPC. Everything else stays as it is (a
-`docker-compose.testnet.yml` override, to be written once the inputs below
-exist).
+The runnable example uses a local chain and fake funds. A public-network example
+is a separate step; this repository does not yet include a testnet Compose file
+or recorded testnet settlement evidence.
 
-## Inputs to gather first
+## Required inputs
 
-1. **A Base Sepolia RPC URL.** The public `https://sepolia.base.org` works
-   for smoke tests but rate-limits; an Alchemy/Infura/QuickNode free-tier
-   endpoint is steadier. It goes to the facilitator's chain config and
-   nowhere else; the gateway and client never talk to the chain.
+- A Base Sepolia RPC endpoint.
+- A dedicated facilitator wallet with testnet ETH for transaction gas, or a compatible hosted facilitator.
+- A separate payer wallet with testnet USDC.
+- A receiver address controlled by the operator.
+- Current network, token address, and EIP-712 domain values from official documentation.
 
-2. **A funded facilitator wallet (Base Sepolia ETH for gas).** A fresh
-   keypair, kept out of the repo; it broadcasts settlements and needs
-   testnet ETH only, from a Base Sepolia faucet (the Coinbase developer
-   faucet or the Alchemy faucet). Injected as `FACILITATOR_PRIVATE_KEY` via
-   `.env` (gitignored).
+Keep credentials outside Git. Do not use the local demo keys on a public network.
 
-3. **A funded client wallet (Base Sepolia USDC).** A second fresh keypair;
-   it needs testnet USDC from Circle's faucet (https://faucet.circle.com,
-   select Base Sepolia) and zero ETH, since payments are gasless for the
-   payer. Injected as `CLIENT_PRIVATE_KEY`.
+## Implementation work
 
-4. **A pay-to address.** Any address you control on Base Sepolia; it only
-   receives USDC.
+1. Add a testnet configuration that excludes Anvil and the local funding scripts.
+2. Point the facilitator at the selected network and supply its credentials privately.
+3. Configure the gateway asset and receiver for the same network.
+4. Add a client with explicit network, asset, receiver, and maximum-price checks before signing.
+5. Run one test payment from a separate machine.
+6. Record the quote, final response, settlement transaction, receiver payment, and indexed receipt.
 
-5. **The canonical Base Sepolia USDC contract address.** Confirm it from
-   Circle's docs
-   (https://developers.circle.com/stablecoins/usdc-contract-addresses)
-   rather than trusting any cached value. As of writing Circle lists Base
-   Sepolia USDC at `0x036CbD53842c5426634e7929541eC2318f3dCF7e`, but verify
-   before use.
+The gateway already supports `ASSET_ADDRESS`, `ASSET_CHAIN_ID`, `ASSET_NAME`,
+`ASSET_VERSION`, and `ASSET_DECIMALS`. These override the default Base USDC asset
+only when `ASSET_ADDRESS` is set. A chain-id override alone does not switch networks.
+`PAY_TO` supplies the receiver. Do not add a second configuration mechanism without a demonstrated need.
 
-## What changes in the stack
+The current URL-only facilitator setup does not establish support for hosted
+facilitator authentication. Inspect the installed x402 client API and current
+provider requirements before implementing that integration.
 
-- `docker-compose.testnet.yml`: removes `anvil` and `fund-usdc`, points the
-  facilitator's chain config at `eip155:84532` (Base Sepolia) with the RPC
-  URL, keys from `.env`.
-- `config/rules.json`: unchanged. The gateway's price tags must switch from
-  `USDC::base()` to `USDC::base_sepolia()`, so make the network an env var
-  (`USDC_NETWORK=base|base-sepolia`) as part of this change.
-- Real keys never enter the repo or an image: `.env` locally, a secrets
-  manager in production.
+## Acceptance
 
-## Local shortcuts to revisit before real money
+An unpaid request returns the intended testnet requirements. A bounded client
+payment settles on that network, returns useful origin data, and reaches the
+receipt index. Check the transaction independently of the HTTP response.
 
-- Per-caller pricing requires the caller's API key (`config/callers.json`,
-  sent as `x-sluice-api-key`); a bare `x-sluice-caller` claim prices at the
-  base rate. The compose key is a dev value — issue real high-entropy keys
-  off-machine, and note the key table loads at startup (key changes need a
-  gateway restart).
-- The indexer's `/receipts` endpoint requires the `INDEXER_TOKEN` shared
-  secret (compose ships a dev-only value; use a real secret off-machine).
-- Settle-before-execution means a client can pay for a request the origin
-  then fails; the policy is no auto-retry/refund, with the outcome recorded
-  in the payments table for operator-driven refunds (see
-  [paid-but-failed.md](paid-but-failed.md)).
-- Grafana and Postgres credentials are compose-local defaults.
+Keep [paid-but-failed behavior](paid-but-failed.md) explicit. A public-network test
+must not imply that receipt delivery is durable or that mainnet deployment is complete.

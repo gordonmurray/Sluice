@@ -1,7 +1,7 @@
 #!/bin/sh
 # Fund the client account with USDC on the anvil fork of Base mainnet.
 # Uses anvil cheatcodes to impersonate the real USDC masterMinter and mint
-# test funds. Rung 1 only — fake value, publicly known dev accounts.
+# test funds. Local chains only: fake value, publicly known dev accounts.
 set -eu
 
 RPC="${RPC:-http://anvil:8545}"

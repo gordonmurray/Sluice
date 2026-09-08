@@ -1,4 +1,4 @@
-# Fully offline dev loop: no fork, no internet needed once images are pulled.
+# Offline chain demo: no external RPC. Pull images and build applications first.
 # Anvil runs a fresh chain with Base's chain id (so the facilitator config is
 # unchanged) and a minimal EIP-3009 token stands in for USDC, mirroring its
 # EIP-712 domain fields ("USD Coin", "2", 8453) so gateway and facilitator
@@ -8,7 +8,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.offline.yml run --rm client
 #
 # The token is pre-compiled (contracts/MockUSDC.bin, source alongside) and
-# deployed with cast, so no compiler and no network at stack-up. It deploys
+# deployed with cast, so token deployment needs no compiler or external RPC. It deploys
 # from anvil dev account #3 at nonce 0, making its address deterministic:
 # 0x057ef64E23666F000b34aE31332854aCBd1c8544.
 
@@ -21,7 +21,7 @@ services:
 
   deploy-token:
     # One-shot: put the mock token on the fresh chain before anything pays.
-    image: ghcr.io/foundry-rs/foundry:latest
+    image: ghcr.io/foundry-rs/foundry@sha256:0c00cb0bda1ab1b91c9a6bf60f4c76c09c1a8870824b6d4718afbabacf6f9a17
     container_name: sluice-deploy-token
     depends_on:
       anvil:

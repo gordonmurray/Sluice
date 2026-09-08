@@ -1,4 +1,6 @@
 target
 .git
 docs
-deploy
+.env
+.env.*
+local_docs
