@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Durable paid GET queries and explicitly configured read-only JSON POST routes, with request-bound replay and per-route Bazaar declarations.
+
 - Optional configured Bazaar declarations and payment descriptions for a GET service, with bounded configuration and no product-specific schema in the gateway.
 
 - Optional privacy-preserving GoatCounter gateway events for quotes, rejected payments, first/repeat purchases, stored-response replays and uncertain outcomes, with bounded delivery and private delivery metrics.

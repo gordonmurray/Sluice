@@ -1,4 +1,4 @@
-//! Optional durable delivery for small, read-only paid GET responses.
+//! Optional durable delivery for small, read-only paid responses.
 //! Responses are prepared before settlement and kept with the payment outcome.
 //! Unknown settlement outcomes fail closed; no automatic second authorization.
 use crate::{
@@ -279,13 +279,52 @@ pub async fn guard(State(st): State<Arc<AppState>>, req: Request, next: Next) ->
     ) {
         return next.run(req).await;
     }
-    if req.method() != axum::http::Method::GET {
-        return failure(StatusCode::METHOD_NOT_ALLOWED, "paid_get_only");
+    let is_get = req.method() == axum::http::Method::GET;
+    let is_post = req.method() == axum::http::Method::POST
+        && st
+            .journal_post_paths
+            .iter()
+            .any(|path| path == req.uri().path());
+    if !is_get && !is_post {
+        return failure(StatusCode::METHOD_NOT_ALLOWED, "paid_method_not_supported");
     }
-    if req.uri().query().is_some() {
-        return failure(StatusCode::BAD_REQUEST, "query_not_supported");
+    if req.uri().to_string().len() > 8192 {
+        return failure(StatusCode::URI_TOO_LONG, "request_uri_too_long");
     }
-    let binding = format!("GET {}", req.uri());
+    let (parts, body) = req.into_parts();
+    let body = match to_bytes(body, if is_get { 0 } else { 4096 }).await {
+        Ok(body) => body,
+        Err(_) => {
+            return failure(
+                if is_get {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                },
+                "request_body_not_supported",
+            );
+        }
+    };
+    let content_type = parts
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if is_post && content_type.split(';').next().map(str::trim) != Some("application/json") {
+        return failure(StatusCode::UNSUPPORTED_MEDIA_TYPE, "json_required");
+    }
+    // Preserve old GET bindings, including records created before query support.
+    let binding = if is_get {
+        format!("GET {}", parts.uri)
+    } else {
+        format!(
+            "POST {} {} {:x}",
+            parts.uri,
+            content_type,
+            Sha256::digest(&body)
+        )
+    };
+    let req = Request::from_parts(parts, Body::from(body.clone()));
     let payment = match payment_id(req.headers()) {
         Ok(v) => v,
         Err(_) => {
@@ -324,12 +363,7 @@ pub async fn guard(State(st): State<Arc<AppState>>, req: Request, next: Next) ->
             Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "journal_unavailable"),
         }
     }
-    let (parts, body) = req.into_parts();
-    if to_bytes(body, 0).await.is_err() {
-        return failure(StatusCode::BAD_REQUEST, "get_body_not_supported");
-    }
-    let req = Request::from_parts(parts, Body::empty());
-    let mut probe = Request::new(Body::empty());
+    let mut probe = Request::new(Body::from(body));
     *probe.uri_mut() = req.uri().clone();
     *probe.method_mut() = req.method().clone();
     *probe.headers_mut() = req.headers().clone();
@@ -501,6 +535,7 @@ mod integration {
         let state = Arc::new(AppState {
             analytics,
             journal: Some(Arc::new(Journal::open(file).unwrap())),
+            journal_post_paths: vec!["/paid/resolve".into()],
             public_base: Some("https://example.test".into()),
             origin,
             strip_prefix: None,
@@ -710,6 +745,68 @@ mod integration {
     }
 
     #[tokio::test]
+    async fn query_and_post_replay_bind_exact_inputs_and_survive_restart() {
+        for (method, uri, body) in [
+            ("GET", "/paid/item?q=first", ""),
+            ("POST", "/paid/resolve", r#"{"name":"first"}"#),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("journal.db");
+            let file = file.to_str().unwrap();
+            let settles = Arc::new(AtomicUsize::new(0));
+            let reads = Arc::new(AtomicUsize::new(0));
+            let router = app(file, settles.clone(), reads.clone(), false).await;
+            let mut payload: Value =
+                serde_json::from_slice(&STANDARD.decode(payment(&router).await).unwrap()).unwrap();
+            payload["resource"]["url"] = json!(format!("https://example.test{uri}"));
+            let paid = STANDARD.encode(payload.to_string());
+            let request = |uri: &str, body: &str| {
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("payment-signature", &paid)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .unwrap()
+            };
+            let first = router.oneshot(request(uri, body)).await.unwrap();
+            assert_eq!(first.status(), StatusCode::OK);
+            let first = to_bytes(first.into_body(), 65536).await.unwrap();
+            let router = app(file, settles.clone(), reads.clone(), false).await;
+            let replay = router.clone().oneshot(request(uri, body)).await.unwrap();
+            assert_eq!(replay.status(), StatusCode::OK);
+            assert_eq!(to_bytes(replay.into_body(), 65536).await.unwrap(), first);
+            let changed = if method == "GET" {
+                request("/paid/item?q=second", body)
+            } else {
+                request(uri, r#"{"name":"second"}"#)
+            };
+            assert!(matches!(
+                router
+                    .clone()
+                    .oneshot(changed)
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16(),
+                400 | 409
+            ));
+            assert_eq!(settles.load(Ordering::SeqCst), 1);
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
+            if method == "POST" {
+                assert_eq!(
+                    router
+                        .oneshot(request(uri, &"x".repeat(4097)))
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::PAYLOAD_TOO_LARGE
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn unknown_outcome_blocks_retry_and_bad_requests_do_not_settle() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("journal.db");
@@ -720,7 +817,7 @@ mod integration {
         for (method, path, status) in [
             ("POST", "/paid/item", 405),
             ("GET", "/paid/missing", 404),
-            ("GET", "/paid/item?q=1", 400),
+            ("PUT", "/paid/item", 405),
         ] {
             let response = router
                 .clone()
