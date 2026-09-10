@@ -102,3 +102,19 @@ Each event includes a fresh random, event-only session value so GoatCounter coun
 requests separately. It is unrelated to the caller, wallet or browser and never reused.
 The `event-id-failed` private delivery counter records a random-ID generation failure.
 Statistics for gateway event paths represent request events, not unique people.
+
+## Paid queries and read-only POST endpoints
+
+Journal mode accepts GET query strings. Retries bind to the complete URI.
+Existing GET journal records remain compatible.
+
+Set `JOURNAL_READ_ONLY_POST_PATHS` to a JSON array of exact paths, such as `["/api/resolve"]`.
+Only configure POST endpoints without side effects. The gateway prepares their response before settlement.
+POST bodies require JSON and a maximum size of 4 KiB.
+The replay binding includes the method, URI, content type, and SHA-256 digest of the exact body bytes.
+An identical retry returns the saved response. A changed body cannot reuse the same payment.
+
+`BAZAAR_CONFIG_PATH` accepts the existing single declaration or an object with a `routes` array.
+Each route contains `path`, `description`, and `bazaar`.
+Paths use Axum parameters, such as `/item/{id}`. Bazaar templates retain the protocol syntax, such as `/item/:id`.
+Each route has its own payment description and GET or POST declaration. Unlisted routes have no Bazaar extension.

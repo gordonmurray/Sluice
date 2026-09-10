@@ -56,6 +56,7 @@ struct AppState {
     analytics: analytics::Analytics,
     origin: String,
     journal: Option<Arc<journal::Journal>>,
+    journal_post_paths: Vec<String>,
     public_base: Option<String>,
     strip_prefix: Option<String>,
     http: reqwest::Client,
@@ -249,6 +250,9 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         analytics: analytics::Analytics::from_env()?,
+        journal_post_paths: discovery::read_only_post_paths(
+            env::var("JOURNAL_READ_ONLY_POST_PATHS").ok().as_deref(),
+        )?,
         journal: env::var("PAYMENT_JOURNAL_PATH")
             .ok()
             .map(|p| journal::Journal::open(&p).map(Arc::new))
@@ -354,12 +358,8 @@ fn build_app(
 
     let discovery = env::var("BAZAAR_CONFIG_PATH")
         .ok()
-        .map(|path| discovery::Discovery::load(&path))
+        .map(|path| discovery::Config::load(&path))
         .transpose()?;
-    if let Some(config) = &discovery {
-        x402 = x402.with_extension(config.bazaar.clone());
-    }
-
     // Price tags come from the decision stamped by `stamp_decision` — the
     // rules table is read exactly once per request, so a mid-request reload
     // cannot price under one table and forward under another. Free and
@@ -382,35 +382,39 @@ fn build_app(
         }
     };
 
-    let mut payment_layer = x402.with_dynamic_price(pricer);
-    if let Some(config) = discovery {
-        payment_layer = payment_layer.with_description(config.description);
-    }
-
-    // Layer order (outermost first): stamp_decision, x402, proxy — the
-    // stamp must exist before the x402 layer prices the request.
-    // Reserved gateway paths: /healthz and /metrics belong to the gateway
-    // itself and are never proxied, whatever the rules table says (explicit
-    // routes win over the fallback proxy). An origin's own endpoints at
-    // those names stay reachable under its configured prefix, e.g.
-    // /firn/metrics -> origin /metrics.
-    Ok(Router::new()
+    let make_route = |config: Option<&discovery::Discovery>| {
+        let mut payment_layer = x402.with_dynamic_price(pricer.clone());
+        if let Some(config) = config {
+            payment_layer = payment_layer
+                .with_extension(config.bazaar.clone())
+                .with_description(config.description.clone());
+        }
+        any(proxy)
+            .layer(payment_layer)
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                journal::guard,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                stamp_decision,
+            ))
+            .with_state(state.clone())
+    };
+    let legacy = match &discovery {
+        Some(discovery::Config::Legacy(config)) => Some(config),
+        _ => None,
+    };
+    let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(serve_metrics))
-        .fallback_service(
-            any(proxy)
-                .layer(payment_layer)
-                .layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    journal::guard,
-                ))
-                .layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    stamp_decision,
-                ))
-                .with_state(state.clone()),
-        )
-        .with_state(state))
+        .fallback_service(make_route(legacy));
+    if let Some(discovery::Config::Routes { routes }) = &discovery {
+        for config in routes {
+            router = router.route(&config.path, make_route(Some(&config.declaration)));
+        }
+    }
+    Ok(router)
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -1049,6 +1053,7 @@ mod tests {
         let state = Arc::new(AppState {
             analytics: analytics::Analytics::default(),
             journal: None,
+            journal_post_paths: vec![],
             public_base: None,
             origin,
             strip_prefix: None,
@@ -1305,6 +1310,7 @@ mod tests {
         let state = Arc::new(AppState {
             analytics: analytics::Analytics::default(),
             journal: None,
+            journal_post_paths: vec![],
             public_base: None,
             origin: format!("http://{origin_addr}"),
             strip_prefix: None,
@@ -1457,6 +1463,7 @@ mod tests {
         let state = Arc::new(AppState {
             analytics: analytics::Analytics::default(),
             journal: None,
+            journal_post_paths: vec![],
             public_base: None,
             origin,
             strip_prefix: None,
@@ -1614,6 +1621,7 @@ mod tests {
         let state = Arc::new(AppState {
             analytics: analytics::Analytics::default(),
             journal: None,
+            journal_post_paths: vec![],
             public_base: None,
             origin: "http://unused".into(),
             strip_prefix: None,
