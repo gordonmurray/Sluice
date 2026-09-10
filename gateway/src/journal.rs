@@ -263,9 +263,17 @@ fn payment_id(headers: &HeaderMap) -> Result<Option<(String, Value)>, Error> {
     let decoded = STANDARD
         .decode(value.as_bytes())
         .map_err(|_| Error::Journal)?;
-    let payload: Value = serde_json::from_slice(&decoded).map_err(|_| Error::Journal)?;
+    let mut payload: Value = serde_json::from_slice(&decoded).map_err(|_| Error::Journal)?;
     if payload["x402Version"] != 2 {
         return Err(Error::Journal);
+    }
+    // x402 omits an empty extension map when it serializes the facilitator request.
+    if payload
+        .get("extensions")
+        .and_then(Value::as_object)
+        .is_some_and(|v| v.is_empty())
+    {
+        payload.as_object_mut().map(|v| v.remove("extensions"));
     }
     Ok(Some((hash(&payload), payload)))
 }
@@ -741,6 +749,35 @@ mod integration {
             }
         }
         assert!(successes >= 1);
+        assert_eq!(settles.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_extensions_match_facilitator_serialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let settles = Arc::new(AtomicUsize::new(0));
+        let router = app(
+            dir.path().join("journal.db").to_str().unwrap(),
+            settles.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            false,
+        )
+        .await;
+        let mut payload: Value =
+            serde_json::from_slice(&STANDARD.decode(payment(&router).await).unwrap()).unwrap();
+        payload["extensions"] = json!({});
+        let paid = STANDARD.encode(payload.to_string());
+        for _ in 0..2 {
+            assert_eq!(
+                router
+                    .clone()
+                    .oneshot(request(Some(&paid)))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
         assert_eq!(settles.load(Ordering::SeqCst), 1);
     }
 
