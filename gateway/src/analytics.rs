@@ -130,21 +130,12 @@ impl Analytics {
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
             .build()?;
         let (sender, mut receiver) = mpsc::channel::<Value>(1024);
         tokio::spawn(async move {
-            // One batch per tick also bounds API traffic under load.
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
-                interval.tick().await;
-                let mut hits = Vec::with_capacity(100);
-                while hits.len() < 100 {
-                    match receiver.try_recv() {
-                        Ok(hit) => hits.push(hit),
-                        Err(_) => break,
-                    }
-                }
+                let hits = next_batch(&mut receiver, Duration::from_secs(60)).await;
                 if hits.is_empty() {
                     if receiver.is_closed() {
                         break;
@@ -236,6 +227,20 @@ impl Analytics {
         (Self(Some(Arc::new(Inner { config, sender }))), receiver)
     }
 }
+// Flush a full batch early so a longer interval does not cap throughput at
+// 100 events per minute. Empty batches never produce an HTTP request.
+async fn next_batch(receiver: &mut mpsc::Receiver<Value>, wait: Duration) -> Vec<Value> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut hits = Vec::with_capacity(100);
+    while hits.len() < 100 {
+        match tokio::time::timeout_at(deadline, receiver.recv()).await {
+            Ok(Some(hit)) => hits.push(hit),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    hits
+}
+
 fn classify(outcome: Outcome, status: u16, signed: bool) -> &'static str {
     match outcome {
         Outcome::Purchase => "purchase",
@@ -288,6 +293,42 @@ fn audience(agent: &str, test: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn batches_flush_on_deadline_capacity_and_close() {
+        let (sender, mut receiver) = mpsc::channel(1024);
+        assert!(
+            next_batch(&mut receiver, Duration::from_millis(10))
+                .await
+                .is_empty()
+        );
+        sender.send(json!({"event": 1})).await.unwrap();
+        assert_eq!(
+            next_batch(&mut receiver, Duration::from_millis(10))
+                .await
+                .len(),
+            1
+        );
+        for i in 0..101 {
+            sender.send(json!({"event": i})).await.unwrap();
+        }
+        let full = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_batch(&mut receiver, Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(full.len(), 100);
+        assert_eq!(receiver.len(), 1);
+        drop(sender);
+        let remaining = next_batch(&mut receiver, Duration::from_secs(60)).await;
+        assert_eq!(remaining, vec![json!({"event": 100})]);
+        assert!(
+            next_batch(&mut receiver, Duration::from_secs(60))
+                .await
+                .is_empty()
+        );
+    }
+
     #[test]
     fn separate_quotes_failures_and_claimed_audiences() {
         assert_eq!(classify(Outcome::None, 402, false), "quote");
