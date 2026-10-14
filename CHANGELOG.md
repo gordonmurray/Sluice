@@ -24,6 +24,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Send gateway analytics batches after 60 seconds or 100 events, with a 10-second delivery timeout. Empty batches are skipped; failed batches still are not retried.
+
 - Clarified local setup requirements and best-effort receipt delivery.
 - Excluded environment files from the Docker build context.
 - Use locked Rust dependencies and pinned base images when building application images.
