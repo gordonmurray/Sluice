@@ -255,14 +255,22 @@ fn io_details(
     error: &(dyn std::error::Error + 'static),
 ) -> (Option<std::io::ErrorKind>, Option<i32>) {
     let mut source = Some(error);
+    let mut details = (None, None);
     for _ in 0..16 {
         let Some(error) = source else { break };
         if let Some(error) = error.downcast_ref::<std::io::Error>() {
-            return (Some(error.kind()), error.raw_os_error());
+            details = (Some(error.kind()), error.raw_os_error());
+            if details.1.is_some() {
+                return details;
+            }
+            // Error::source can skip the inner error itself. Inspect get_ref so
+            // an OS error inside Error::other is not hidden by its wrapper.
+            source = error.get_ref().map(|inner| inner as &dyn std::error::Error);
+        } else {
+            source = error.source();
         }
-        source = error.source();
     }
-    (None, None)
+    details
 }
 // Flush a full batch early so a longer interval does not cap throughput at
 // 100 events per minute. Empty batches never produce an HTTP request.
@@ -344,6 +352,11 @@ mod tests {
             .context("private request details");
         assert_eq!(
             io_details(wrapped.as_ref()),
+            (Some(std::io::ErrorKind::ConnectionReset), Some(104))
+        );
+        let wrapped = std::io::Error::other(std::io::Error::from_raw_os_error(104));
+        assert_eq!(
+            io_details(&wrapped),
             (Some(std::io::ErrorKind::ConnectionReset), Some(104))
         );
         assert_eq!(
