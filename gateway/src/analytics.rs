@@ -143,6 +143,7 @@ impl Analytics {
                     continue;
                 }
                 let count = hits.len() as u64;
+                let started = std::time::Instant::now();
                 let result = client
                     .post(url.clone())
                     .json(&json!({"no_sessions":true,"hits":hits}))
@@ -153,8 +154,29 @@ impl Analytics {
                     .analytics_delivery
                     .with_label_values(&[if delivered { "delivered" } else { "failed" }])
                     .inc_by(count);
-                if !delivered {
-                    tracing::warn!("analytics batch unavailable; events dropped");
+                match result {
+                    Ok(response) if !delivered => tracing::warn!(
+                        http_status = response.status().as_u16(),
+                        events = count,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "analytics HTTP failure; events dropped"
+                    ),
+                    Err(error) => {
+                        let (io_kind, os_error) = io_details(&error);
+                        tracing::warn!(
+                            timeout = error.is_timeout(),
+                            connect = error.is_connect(),
+                            request = error.is_request(),
+                            body = error.is_body(),
+                            decode = error.is_decode(),
+                            ?io_kind,
+                            ?os_error,
+                            events = count,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "analytics transport failure; events dropped"
+                        );
+                    }
+                    _ => {}
                 }
                 // No automatic retry: an ambiguous API response could duplicate events.
             }
@@ -227,6 +249,21 @@ impl Analytics {
         (Self(Some(Arc::new(Inner { config, sender }))), receiver)
     }
 }
+// Never format the error or its sources: they can contain URLs or other private
+// input. Only typed OS diagnostics and reqwest's boolean categories are logged.
+fn io_details(
+    error: &(dyn std::error::Error + 'static),
+) -> (Option<std::io::ErrorKind>, Option<i32>) {
+    let mut source = Some(error);
+    for _ in 0..16 {
+        let Some(error) = source else { break };
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            return (Some(error.kind()), error.raw_os_error());
+        }
+        source = error.source();
+    }
+    (None, None)
+}
 // Flush a full batch early so a longer interval does not cap throughput at
 // 100 events per minute. Empty batches never produce an HTTP request.
 async fn next_batch(receiver: &mut mpsc::Receiver<Value>, wait: Duration) -> Vec<Value> {
@@ -293,6 +330,27 @@ fn audience(agent: &str, test: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostics_extract_types_without_private_error_text() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "https://private.example/?token=secret",
+        );
+        assert_eq!(
+            io_details(&error),
+            (Some(std::io::ErrorKind::ConnectionReset), None)
+        );
+        let wrapped = anyhow::Error::new(std::io::Error::from_raw_os_error(104))
+            .context("private request details");
+        assert_eq!(
+            io_details(wrapped.as_ref()),
+            (Some(std::io::ErrorKind::ConnectionReset), Some(104))
+        );
+        assert_eq!(
+            io_details(anyhow::anyhow!("private details").as_ref()),
+            (None, None)
+        );
+    }
     #[tokio::test]
     async fn batches_flush_on_deadline_capacity_and_close() {
         let (sender, mut receiver) = mpsc::channel(1024);
