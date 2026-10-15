@@ -92,6 +92,11 @@ five-second timeout and no redirects. Failures do not block requests. No automat
 because an ambiguous response could duplicate events. Queued events can be lost on process exit.
 The private `sluice_gateway_analytics_events_total` metric reports `delivered`, `failed`, and
 `queue-full` counts. GoatCounter events are best-effort usage statistics, not the revenue ledger.
+
+Failed delivery warnings distinguish HTTP responses from transport errors. They include the
+numeric HTTP status or typed transport categories and available OS error kinds and codes.
+They also include the event count and elapsed milliseconds. They exclude raw error text,
+URLs, headers, payloads and response bodies. Failed batches are not retried.
 Do not sum origin preparation events, gateway events and browser pageviews as unique users.
 
 Offline tests cover privacy, bounded queues, quote/purchase/repeat/replay classification,
